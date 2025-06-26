@@ -24,7 +24,7 @@ class Config:
 
     BATCH_SIZE = 4
     LEARNING_RATE = 1e-5
-    EPOCHS = 10
+    EPOCHS = 5
     WEIGHT_DECAY = 1e-5
 
     OPTIMIZER_CONFIG = {

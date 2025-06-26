@@ -140,13 +140,13 @@ def get_dataloader(dataset_name, subset, batch_size=None, shuffle=True):
     # Define size limits for each dataset and subset
     size_limits = {
         'celebahq': {
-            'train': 60000,  # Max 84,020
-            'valid': 6000,   # Max 8,520
-            'test': 10000    # Max 12,972
+            'train': 980,  # Max 84,020
+            'valid': 10,   # Max 8,520
+            'test': 10    # Max 12,972
         },
         'ffhq': {
-            'train': 40000,  # Max 49,000
-            'valid': 4000,   # Max 5,000
+            'train': 980,  # Max 49,000
+            'valid': 20,   # Max 5,000
             'test': 0        # No test split
         }
     }

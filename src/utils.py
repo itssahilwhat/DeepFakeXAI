@@ -1,4 +1,5 @@
 import os
+import cv2
 import time
 import torch
 import numpy as np
@@ -7,6 +8,8 @@ from torchvision.utils import save_image
 from config import Config
 from torch.amp import autocast
 from pytorch_grad_cam import GradCAMPlusPlus
+from pytorch_grad_cam.utils.model_targets import SemanticSegmentationTarget
+
 
 
 def save_checkpoint(state, filename="checkpoint.pth.tar"):
@@ -84,35 +87,116 @@ def validation_step(model, batch, criterion):
     return loss.item(), outputs, masks
 
 
-def save_mask_predictions(images, masks, predictions, out_dir):
+def save_mask_predictions(images, masks, predictions, out_dir, realistic_overlay=True):
+    import cv2
     os.makedirs(out_dir, exist_ok=True)
-    for img, mask, pred in zip(images, masks, predictions):
-        img_np = img.cpu().permute(1, 2, 0).numpy()
-        mask_np = mask.cpu().squeeze().numpy()
-        pred_np = pred.cpu().squeeze().numpy()
-        overlay = (pred_np > 0.5).astype(np.uint8) * 255
-        pil_img = Image.fromarray((img_np * 255).astype(np.uint8))
-        pil_mask = Image.fromarray(overlay)
-        fname = f"{int(time.time()*1000)}.png"
-        save_path = os.path.join(out_dir, fname)
-        pil_img.paste(pil_mask, (0, 0), pil_mask)
-        pil_img.save(save_path)
+
+    for i, (img, mask, pred) in enumerate(zip(images, masks, predictions)):
+        # --- Fix 1: Convert image correctly to preserve RGB colors ---
+        img_np = img.detach().cpu().permute(1, 2, 0).numpy()
+        img_np = np.clip(img_np * 255.0, 0, 255).astype(np.uint8)
+
+        # --- Mask and prediction ---
+        mask_np = (mask.cpu().squeeze().numpy() * 255).astype(np.uint8)
+        pred_np = pred.detach().cpu().squeeze().numpy()
+
+        # Resize if needed
+        if mask_np.shape != img_np.shape[:2]:
+            mask_np = cv2.resize(mask_np, (img_np.shape[1], img_np.shape[0]))
+        if pred_np.shape != img_np.shape[:2]:
+            pred_np = cv2.resize(pred_np, (img_np.shape[1], img_np.shape[0]))
+
+        # --- Fix 2: Normalize prediction map for proper color range ---
+        norm_pred = 255 * (pred_np - pred_np.min()) / (pred_np.max() - pred_np.min() + 1e-6)
+        norm_pred = norm_pred.astype(np.uint8)
+
+        heatmap = cv2.applyColorMap(norm_pred, cv2.COLORMAP_JET)
+
+        if realistic_overlay:
+            # === Realistic Overlay: Blend only strong regions ===
+            threshold = 0.2
+            alpha_mask = (pred_np > threshold).astype(np.float32)
+            alpha_mask = cv2.GaussianBlur(alpha_mask, (11, 11), 0)
+            alpha_mask = np.clip(alpha_mask, 0, 1)
+
+            blended = img_np.astype(np.float32)
+            for c in range(3):
+                blended[:, :, c] = img_np[:, :, c] * (1 - alpha_mask) + heatmap[:, :, c] * alpha_mask
+            blended = np.clip(blended, 0, 255).astype(np.uint8)
+        else:
+            # === Classic full-image blending ===
+            blended = cv2.addWeighted(img_np, 0.7, heatmap, 0.3, 0)
+
+        # Stack side-by-side: Original | GT Mask | Pred Mask | Blended
+        mask_color = cv2.cvtColor(mask_np, cv2.COLOR_GRAY2BGR)
+        pred_color = cv2.cvtColor(norm_pred, cv2.COLOR_GRAY2BGR)
+        side_by_side = cv2.hconcat([img_np, mask_color, pred_color, blended])
+
+        # Save
+        fname = f"pred_{int(time.time()*1000)}_{i}.png"
+        cv2.imwrite(os.path.join(out_dir, fname), side_by_side)
 
 
-def generate_gradcam(model, input_tensor, target_layer):
-    # Cache for feature maps
+def generate_gradcam(model, input_tensor, target_layer, realistic_overlay=True):
+    import cv2
+    os.makedirs(Config.OUTPUT_DIR, exist_ok=True)
+
+    # Cache feature maps (not strictly required with GradCAMPlusPlus, kept for future use)
     cache = {}
     def forward_hook(module, input, output):
         cache[id(module)] = output.detach()
-
     handle = target_layer.register_forward_hook(forward_hook)
+
     try:
+        # GradCAM setup
         cam = GradCAMPlusPlus(model=model, target_layers=[target_layer])
-        cam_map = cam(input_tensor)[0]
+
+        # Target for Grad-CAM: binary segmentation mask presence
+        targets = [SemanticSegmentationTarget(0, (input_tensor[0, 0] > 0.5).cpu().numpy())]
+        cam_map = cam(input_tensor, targets)[0]  # shape: (H, W)
+
+        # --- Normalize Grad-CAM map for heatmap ---
         cam_map = (cam_map - cam_map.min()) / (cam_map.max() - cam_map.min() + 1e-6)
+        cam_map_uint8 = np.uint8(cam_map * 255)
+        heatmap = cv2.applyColorMap(cam_map_uint8, cv2.COLORMAP_JET)
+
+        # --- Restore original image (true RGB) ---
+        input_np = input_tensor[0].detach().cpu().permute(1, 2, 0).numpy()
+        input_np = np.clip(input_np * 255.0, 0, 255).astype(np.uint8)
+
+        # Resize heatmap to match original image
+        if heatmap.shape[:2] != input_np.shape[:2]:
+            heatmap = cv2.resize(heatmap, (input_np.shape[1], input_np.shape[0]))
+
+        if realistic_overlay:
+            # === Realistic Grad-CAM Overlay ===
+            threshold = 0.2
+            alpha_mask = (cam_map > threshold).astype(np.float32)
+            alpha_mask = cv2.GaussianBlur(alpha_mask, (11, 11), 0)
+            alpha_mask = np.clip(alpha_mask, 0, 1)
+
+            overlay = input_np.astype(np.float32)
+            for c in range(3):
+                overlay[:, :, c] = input_np[:, :, c] * (1 - alpha_mask) + heatmap[:, :, c] * alpha_mask
+            overlay = np.clip(overlay, 0, 255).astype(np.uint8)
+        else:
+            # === Classic Full-image Grad-CAM Overlay ===
+            overlay = cv2.addWeighted(input_np, 0.6, heatmap, 0.4, 0)
+
+        # Save side-by-side: Original | Heatmap | Overlay
+        timestamp = int(time.time() * 1000)
+        side_by_side = cv2.hconcat([input_np, heatmap, overlay])
+
+        heatmap_path = os.path.join(Config.OUTPUT_DIR, f"cam_heatmap_{timestamp}.png")
+        compare_path = os.path.join(Config.OUTPUT_DIR, f"cam_overlay_{timestamp}.png")
+
+        cv2.imwrite(heatmap_path, heatmap)
+        cv2.imwrite(compare_path, side_by_side)
+
     finally:
         handle.remove()
-    return cam_map
+
+    return cam_map  # return original normalized Grad-CAM map
 
 
 def region_query(model, image, region):

@@ -82,6 +82,10 @@ def train_model(dataset_name):
     teacher.classifier = nn.Linear(teacher.classifier[1].in_features, 1).to(Config.DEVICE)
     teacher.eval()
 
+    # 🛠️ Force model submodules to initialize before loading checkpoint
+    with torch.no_grad():
+        _ = model(torch.randn(1, 3, 224, 224).to(Config.DEVICE))
+
     logger.info(f"🚀 Models moved to {Config.DEVICE}")
 
     optimizer = torch.optim.Adam(model.parameters(), lr=Config.OPTIMIZER_CONFIG["lr"],
@@ -209,13 +213,19 @@ def train_model(dataset_name):
     if test_loader:
         logger.info("🧪 Evaluating on test set...")
         quantized_model.eval()
-        with torch.no_grad():
-            for batch in tqdm(test_loader, desc="Test Evaluation", dynamic_ncols=True):
-                log_vram_usage()
+        for batch in tqdm(test_loader, desc="Test Evaluation", dynamic_ncols=True):
+            log_vram_usage()
+
+            with torch.no_grad():
                 loss, preds, labels = test_step(quantized_model, batch, criterion)
-                save_mask_predictions(batch["image"], batch["mask"], preds, os.path.join(Config.OUTPUT_DIR, "test_preds"))
-                cam_map = generate_gradcam(quantized_model, batch["image"].to(Config.DEVICE), quantized_model.decoder.conv0)
-                save_image(torch.from_numpy(cam_map).unsqueeze(0), os.path.join(Config.OUTPUT_DIR, f"cam_{int(time.time()*1000)}.png"))
+                save_mask_predictions(batch["image"], batch["mask"], preds,
+                                      os.path.join(Config.OUTPUT_DIR, "test_preds"))
+
+            # Grad-CAM needs gradients!
+            batch_images = batch["image"].clone().detach().to(Config.DEVICE).requires_grad_()
+            cam_map = generate_gradcam(quantized_model, batch_images, quantized_model.decoder.conv0)
+            save_image(torch.from_numpy(cam_map).unsqueeze(0),
+                       os.path.join(Config.OUTPUT_DIR, f"cam_{int(time.time() * 1000)}.png"))
     else:
         logger.info("⚠️ No test data available. Skipping test evaluation.")
 
