@@ -1,0 +1,8 @@
+Metric,Value
+loss,0.0331
+dice,0.8615
+iou,0.7590
+acc,0.7557
+precision,0.7579
+recall,1.0000
+f1,0.8615

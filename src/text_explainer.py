@@ -1,42 +1,81 @@
+# src/text_explainer.py
 import torch
-import torch.nn as nn
-from transformers import DistilBertTokenizerFast, DistilBertForSequenceClassification, Trainer, TrainingArguments
+import clip
+from config import Config
+from PIL import Image
+import numpy as np
+
 
 class ArtifactTextExplainer:
-    def __init__(self, model_path=None, train_dataset=None):
+    def __init__(self, model_path=None):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.tokenizer = DistilBertTokenizerFast.from_pretrained("distilbert-base-uncased")
-        if model_path:
-            self.model = DistilBertForSequenceClassification.from_pretrained(model_path)
+
+        if Config.USE_CLIP_EXPLAINER:
+            # CLIP-based explanation setup
+            self.clip_model, self.clip_preprocess = clip.load("ViT-B/32", device=self.device)
+            self.artifact_descriptions = {
+                "blur": ["blurry face edges", "unfocused facial features",
+                         "hazy texture around nose and mouth"],
+                "warp": ["unnatural face contours", "distorted facial proportions",
+                         "misaligned facial landmarks"],
+                "color": ["inconsistent skin tones", "unnatural lighting patterns",
+                          "mismatched color gradients"],
+                "texture": ["repetitive skin patterns", "artificial skin pores",
+                            "synthetic hair texture"]
+            }
         else:
-            self.model = DistilBertForSequenceClassification.from_pretrained("distilbert-base-uncased", num_labels=2)
-            if train_dataset:
-                training_args = TrainingArguments(
-                    output_dir='./results', num_train_epochs=3, per_device_train_batch_size=16,
-                    save_steps=500, save_total_limit=2
-                )
-                trainer = Trainer(model=self.model, args=training_args, train_dataset=train_dataset)
-                trainer.train()
-        self.model.to(self.device)
-        self.model = torch.quantization.quantize_dynamic(self.model, {torch.nn.Linear}, dtype=torch.qint8)
-        self.model.eval()
-
-    def predict(self, artifacts):
-        inputs = self.tokenizer(artifacts, padding=True, truncation=True, return_tensors="pt")
-        inputs = {k: v.to(self.device) for k, v in inputs.items()}
-        with torch.no_grad():
-            outputs = self.model(**inputs)
-            logits = outputs.logits
-            probs = torch.softmax(logits, dim=-1)
-        return logits.cpu().numpy(), probs.cpu().numpy()
-
-    def explain(self, artifact_list):
-        explanations = []
-        for art in artifact_list:
-            if "blurr" in art:
-                explanations.append(f"The image contains a blur artifact in region: {art}.")
-            elif "warp" in art or "distort" in art:
-                explanations.append(f"The image contains a warp/distortion artifact: {art}.")
+            # Original DistilBERT approach
+            from transformers import DistilBertTokenizerFast, DistilBertForSequenceClassification
+            self.tokenizer = DistilBertTokenizerFast.from_pretrained("distilbert-base-uncased")
+            if model_path:
+                self.model = DistilBertForSequenceClassification.from_pretrained(model_path)
             else:
-                explanations.append(f"Detected artifact: {art}.")
-        return explanations
+                self.model = DistilBertForSequenceClassification.from_pretrained(
+                    "distilbert-base-uncased", num_labels=2
+                )
+            self.model.to(self.device)
+            self.model.eval()
+
+    def explain(self, artifacts, image=None):
+        if Config.USE_CLIP_EXPLAINER and image is not None:
+            # CLIP-based explanation
+            image_input = self.clip_preprocess(image).unsqueeze(0).to(self.device)
+            phrases = []
+            for artifact in artifacts:
+                if artifact in self.artifact_descriptions:
+                    phrases.extend(self.artifact_descriptions[artifact])
+
+            if not phrases:
+                return "No artifacts detected"
+
+            text_inputs = clip.tokenize(phrases).to(self.device)
+            with torch.no_grad():
+                image_features = self.clip_model.encode_image(image_input)
+                text_features = self.clip_model.encode_text(text_inputs)
+
+                # Normalize features
+                image_features /= image_features.norm(dim=-1, keepdim=True)
+                text_features /= text_features.norm(dim=-1, keepdim=True)
+
+                # Calculate similarity
+                similarity = (image_features @ text_features.T).softmax(dim=-1)
+                values, indices = similarity[0].topk(min(2, len(phrases)))
+
+            # Generate explanation
+            explanation = "Detected artifacts: "
+            for i, idx in enumerate(indices):
+                explanation += f"{phrases[idx]} ({values[i].item():.2f})"
+                if i < len(indices) - 1:
+                    explanation += ", "
+            return explanation
+        else:
+            # Template-based explanation
+            explanations = []
+            for art in artifacts:
+                if "blur" in art:
+                    explanations.append(f"The image contains a blur artifact in region: {art}.")
+                elif "warp" in art or "distort" in art:
+                    explanations.append(f"The image contains a warp/distortion artifact: {art}.")
+                else:
+                    explanations.append(f"Detected artifact: {art}.")
+            return " ".join(explanations) if explanations else "No artifacts detected"
