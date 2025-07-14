@@ -1,3 +1,5 @@
+# src/train.py
+
 import os
 import csv
 import logging
@@ -6,37 +8,45 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.optim.lr_scheduler import StepLR
-from torch.amp import GradScaler, autocast
+from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
 from tqdm import tqdm
 from torch.nn.utils import prune
 from torchvision.utils import save_image
 from torchvision.models import efficientnet_b0, EfficientNet_B0_Weights
+from torch import autocast
+from torch.amp import GradScaler
+try:
+    from torch.utils.tensorboard import SummaryWriter
+    TENSORBOARD_AVAILABLE = True
+except ImportError:
+    TENSORBOARD_AVAILABLE = False
+    SummaryWriter = None
 
-from config import Config
-from data import get_dataloader
-from model import EfficientNetLiteTemporal
-from utils import (
-    save_checkpoint, load_checkpoint, validation_step, test_step,
+from src.config import Config
+from src.data import get_dataloader
+from src.model import EfficientNetLiteTemporal
+from src.utils import (
+    save_checkpoint, load_checkpoint,
     precision_recall_f1, dice_coefficient, iou_pytorch,
-    save_mask_predictions, generate_gradcam, generate_pseudo_masks,
-    evaluate_metrics, MetricLogger
+    save_mask_predictions, generate_gradcam, generate_lime_overlay,
+    MetricLogger
 )
-torch.backends.cudnn.benchmark = True
-torch.backends.cuda.matmul.allow_tf32 = True  # For modern GPUs
-torch.backends.cudnn.allow_tf32 = True
-torch.backends.cudnn.deterministic = False  # For speed
+from src.losses import HybridLoss, ComboLoss
+from src.advanced_metrics import AdvancedMetrics
+from src.robustness_testing import RobustnessTester
+from src.interpretability import InterpretabilityTools
+from src.cross_dataset_evaluation import CrossDatasetEvaluator
 
-# ✅ 4️⃣ Reproducibility seeds
+
 def set_seeds(seed=42):
-
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = False  # For speed
+    torch.backends.cudnn.benchmark = True  # Enable for speed
+
 
 class FocalLoss(nn.Module):
     def __init__(self, alpha=0.25, gamma=2):
@@ -52,6 +62,7 @@ class FocalLoss(nn.Module):
             F_loss = F_loss * weights
         return F_loss.mean()
 
+
 def compute_boundary_weights(masks):
     weights = torch.ones_like(masks)
     kernel_size = Config.BOUNDARY_KERNEL_SIZE
@@ -62,11 +73,12 @@ def compute_boundary_weights(masks):
     weights[edges] = 2.0
     return weights
 
+
 def accuracy(preds, targets):
     correct = (preds == targets).float()
     return correct.sum() / correct.numel()
 
-# ✅ 1️⃣ Utility function to move all tensors to device
+
 def move_to_device(batch, device):
     result = {}
     for k, v in batch.items():
@@ -76,9 +88,10 @@ def move_to_device(batch, device):
             result[k] = v
     return result
 
+
 def train_model(dataset_names):
     Config.setup_logging()
-    set_seeds()  # ✅ 4️⃣
+    set_seeds()  # reproducibility
 
     logger = logging.getLogger("training")
 
@@ -110,14 +123,25 @@ def train_model(dataset_names):
     combined_valid = torch.utils.data.ConcatDataset(valid_datasets)
     combined_test = torch.utils.data.ConcatDataset(test_datasets) if test_datasets else None
 
+    # ── CAP combined datasets to desired sizes ──
+    if Config.TRAIN_SIZE is not None and len(combined_train) > Config.TRAIN_SIZE:
+        indices = random.sample(range(len(combined_train)), Config.TRAIN_SIZE)
+        combined_train = torch.utils.data.Subset(combined_train, indices)
+    if Config.VAL_SIZE is not None and len(combined_valid) > Config.VAL_SIZE:
+        indices = random.sample(range(len(combined_valid)), Config.VAL_SIZE)
+        combined_valid = torch.utils.data.Subset(combined_valid, indices)
+    if combined_test and Config.TEST_SIZE is not None and len(combined_test) > Config.TEST_SIZE:
+        indices = random.sample(range(len(combined_test)), Config.TEST_SIZE)
+        combined_test = torch.utils.data.Subset(combined_test, indices)
+
     train_loader = torch.utils.data.DataLoader(
         combined_train,
         batch_size=Config.BATCH_SIZE,
         shuffle=True,
         num_workers=Config.NUM_WORKERS,
         pin_memory=Config.PIN_MEMORY,
-        prefetch_factor=2 if Config.DEVICE == "cuda" else None,
-        persistent_workers=True if Config.NUM_WORKERS > 0 else False
+        drop_last=True,  # Drop incomplete batches for consistent training
+        persistent_workers=True  # Keep workers alive for speed
     )
 
     valid_loader = torch.utils.data.DataLoader(
@@ -126,8 +150,8 @@ def train_model(dataset_names):
         shuffle=False,
         num_workers=Config.NUM_WORKERS,
         pin_memory=Config.PIN_MEMORY,
-        prefetch_factor=2 if Config.DEVICE == "cuda" else None,
-        persistent_workers=True if Config.NUM_WORKERS > 0 else False
+        drop_last=False,
+        persistent_workers=True  # Keep workers alive for speed
     )
 
     test_loader = torch.utils.data.DataLoader(
@@ -136,8 +160,8 @@ def train_model(dataset_names):
         shuffle=False,
         num_workers=Config.NUM_WORKERS,
         pin_memory=Config.PIN_MEMORY,
-        prefetch_factor=2 if Config.DEVICE == "cuda" else None,
-        persistent_workers=True if Config.NUM_WORKERS > 0 else False
+        drop_last=False,
+        persistent_workers=True  # Keep workers alive for speed
     ) if combined_test else None
 
     logger.info(
@@ -146,27 +170,95 @@ def train_model(dataset_names):
         f"Test: {len(combined_test) if combined_test else 0}"
     )
 
-    model = EfficientNetLiteTemporal(num_classes=Config.NUM_CLASSES, pretrained=Config.PRETRAINED).to(Config.DEVICE)
-    teacher = efficientnet_b0(weights=EfficientNet_B0_Weights.DEFAULT).to(Config.DEVICE)
-    teacher.classifier = nn.Linear(teacher.classifier[1].in_features, 1).to(Config.DEVICE)
-    teacher.eval()
+    # Model and teacher
+    model = EfficientNetLiteTemporal(num_classes=Config.NUM_CLASSES, pretrained=True).to(Config.DEVICE)
+    
+    # Initialize the segmentation head properly
+    def init_weights(m):
+        if isinstance(m, nn.Conv2d):
+            nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+        elif isinstance(m, nn.BatchNorm2d):
+            nn.init.constant_(m.weight, 1)
+            nn.init.constant_(m.bias, 0)
+    
+    # Apply initialization to segmentation head
+    model.seg_head.apply(init_weights)
+    
+    # Clear any stranded cache before training
+    if Config.DEVICE == "cuda":
+        torch.cuda.empty_cache()
 
-    optimizer = torch.optim.Adam(
+    # Optimizer, scheduler, scaler
+    optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=Config.OPTIMIZER_CONFIG["lr"],
         weight_decay=Config.OPTIMIZER_CONFIG["weight_decay"],
         betas=Config.OPTIMIZER_CONFIG["betas"],
+        eps=Config.OPTIMIZER_CONFIG["eps"],
         amsgrad=Config.OPTIMIZER_CONFIG.get("amsgrad", False)
     )
-    scheduler = StepLR(optimizer, step_size=Config.SCHEDULER_STEP_SIZE, gamma=Config.SCHEDULER_GAMMA)
-    scaler = GradScaler()
-    criterion = FocalLoss(alpha=0.25, gamma=2)
-    mse_loss = nn.MSELoss()
+    
+    # Fast scheduler for convergence
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+        optimizer, 
+        T_0=Config.SCHEDULER_T0,  # Restart every 3 epochs
+        T_mult=Config.SCHEDULER_T_MULT,  # Double the restart interval
+        eta_min=Config.SCHEDULER_ETA_MIN  # Minimum learning rate
+    )
 
+    # Mixed precision scaler
+    scaler = GradScaler("cuda") if Config.USE_AMP else None
+
+    # Loss - Use combined loss for better metrics
+    class CombinedLoss(nn.Module):
+        def __init__(self, dice_weight=0.8, bce_weight=0.15, focal_weight=0.05):
+            super().__init__()
+            self.dice_weight = dice_weight
+            self.bce_weight = bce_weight
+            self.focal_weight = focal_weight
+            self.bce_loss = nn.BCEWithLogitsLoss()
+            self.focal_loss = FocalLoss()
+            
+        def forward(self, pred, target):
+            # BCE Loss
+            bce = self.bce_loss(pred, target)
+            
+            # Dice Loss
+            pred_sigmoid = torch.sigmoid(pred)
+            dice = 1 - dice_coefficient(pred_sigmoid, target)
+            
+            # Focal Loss
+            focal = self.focal_loss(pred, target)
+            
+            # Combined loss
+            total_loss = (self.bce_weight * bce + 
+                         self.dice_weight * dice + 
+                         self.focal_weight * focal)
+            
+            return total_loss
+
+    criterion = CombinedLoss(
+        dice_weight=Config.LOSS_WEIGHTS["dice_weight"],
+        bce_weight=Config.LOSS_WEIGHTS["bce_weight"],
+        focal_weight=Config.LOSS_WEIGHTS["focal_weight"]
+    )
+
+    # Directories
     os.makedirs(Config.CHECKPOINT_DIR, exist_ok=True)
     os.makedirs(Config.LOG_DIR, exist_ok=True)
     os.makedirs(Config.OUTPUT_DIR, exist_ok=True)
+    
+    # TensorBoard setup (optional)
+    if TENSORBOARD_AVAILABLE:
+        tb_dir = os.path.join(Config.LOG_DIR, "tensorboard")
+        os.makedirs(tb_dir, exist_ok=True)
+        writer = SummaryWriter(tb_dir)
+        logger.info("✅ TensorBoard logging enabled")
+    else:
+        writer = None
+        logger.info("⚠️ TensorBoard not available, skipping TB logging")
 
+    # CSV logging setup
     csv_log_path = os.path.join(Config.LOG_DIR, "training_metrics.csv")
     if not os.path.exists(csv_log_path):
         with open(csv_log_path, "w") as f:
@@ -180,6 +272,7 @@ def train_model(dataset_names):
 
     checkpoint_path = os.path.join(Config.CHECKPOINT_DIR, "best_combined.pth")
     start_epoch, best_val_loss = 0, float("inf")
+    epochs_no_improve = 0  # early stopping counter
 
     if os.path.exists(checkpoint_path):
         dummy_input = torch.randn(1, 3, *Config.INPUT_SIZE).to(Config.DEVICE)
@@ -193,19 +286,27 @@ def train_model(dataset_names):
         if Config.DEVICE == "cuda":
             allocated = torch.cuda.memory_allocated() / 1024 ** 2
             reserved = torch.cuda.memory_reserved() / 1024 ** 2
-            tqdm.write(f"🖥️ VRAM Usage: Allocated={allocated:.2f}MB, Reserved={reserved:.2f}MB")
+            max_allocated = torch.cuda.max_memory_allocated() / 1024 ** 2
+            tqdm.write(f"🖥️ VRAM: Allocated={allocated:.1f}MB, Reserved={reserved:.1f}MB, Max={max_allocated:.1f}MB")
             return allocated, reserved
         return 0, 0
 
     train_logger = MetricLogger(["loss", "dice", "iou", "acc"])
     val_logger = MetricLogger(["loss", "dice", "iou", "acc", "precision", "recall", "f1"])
 
-    prev_outputs = None
-
+    # ── MAIN TRAIN/VALIDATE LOOP ──
     for epoch in range(start_epoch + 1, Config.EPOCHS + 1):
+        # Clear cache each epoch
+        if Config.DEVICE == "cuda":
+            torch.cuda.empty_cache()
+        else:
+            # Force garbage collection for CPU training
+            import gc
+            gc.collect()
+
+                # TRAIN - OPTIMIZED FOR SPEED
         model.train()
         train_logger.reset()
-
         pbar = tqdm(
             enumerate(train_loader),
             desc=f"[Epoch {epoch}] Training",
@@ -214,72 +315,82 @@ def train_model(dataset_names):
             dynamic_ncols=True,
             smoothing=0.1
         )
-
+        
         for batch_idx, batch in pbar:
-            # Move data with non_blocking and channels_last
-            images = batch["image"].to(Config.DEVICE, non_blocking=True).contiguous(memory_format=torch.channels_last)
-            masks = batch["mask"].to(Config.DEVICE, non_blocking=True)
-            labels = batch["label"].to(Config.DEVICE, non_blocking=True)
-
-            weights = compute_boundary_weights(masks)
-
-            if Config.USE_WEAK_SUPERVISION:
-                with torch.no_grad():
-                    _, pseudo_masks = model(images)
-                valid_mask = (masks is not None).float()
-                final_masks = valid_mask * masks + (1 - valid_mask) * (pseudo_masks > 0.5).float()
-            else:
-                final_masks = masks
-
-            optimizer.zero_grad(set_to_none=True)
-
-            with autocast(device_type='cuda', dtype=torch.float16):
-                cls_output, seg_logits = model(
-                    images,
-                    prev_x=prev_outputs if prev_outputs is not None and prev_outputs.size(0) == images.size(0) else None
-                )
-
-                seg_loss = criterion(seg_logits, final_masks, weights)
-
-                cls_loss = F.binary_cross_entropy_with_logits(cls_output, labels.float().view(-1, 1)) \
-                    if Config.USE_COLLABORATIVE and cls_output is not None else 0
-
-                temporal_loss = 0.1 * F.mse_loss(seg_logits, prev_outputs) \
-                    if prev_outputs is not None and prev_outputs.size(0) == seg_logits.size(0) else 0
-
-                with torch.no_grad():
-                    teacher_output = torch.sigmoid(teacher(images))
-                distill_loss = 0.5 * mse_loss(
-                    F.avg_pool2d(seg_logits, kernel_size=seg_logits.shape[2:]).squeeze(-1).squeeze(-1),
-                    teacher_output
-                )
-
-                loss = seg_loss + cls_loss + temporal_loss + distill_loss
-
-            if torch.isnan(loss):
+            images = batch["image"].to(Config.DEVICE, non_blocking=True)
+            masks  = batch["mask"].to(Config.DEVICE, non_blocking=True)
+            
+            if masks.sum() == 0:
                 continue
 
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
+            optimizer.zero_grad(set_to_none=True)
+            
+            # Mixed precision forward pass - OPTIMIZED
+            if Config.USE_AMP:
+                with autocast("cuda"):
+                    cls_logits, seg_logits = model(images)
+                    seg_loss = criterion(seg_logits, masks)
+                    if cls_logits is not None:
+                        cls_target = masks.mean(dim=[2, 3]).unsqueeze(1)
+                        if cls_target.shape != cls_logits.shape:
+                            cls_target = cls_target.squeeze(-1)
+                        cls_loss = F.binary_cross_entropy_with_logits(cls_logits, cls_target)
+                    else:
+                        cls_loss = 0
+                    loss = seg_loss + 0.05 * cls_loss if cls_logits is not None else seg_loss
+                
+                # Mixed precision backward pass
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=Config.MAX_GRAD_NORM)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                # Standard forward pass
+                cls_logits, seg_logits = model(images)
+                seg_loss = criterion(seg_logits, masks)
+                if cls_logits is not None:
+                    cls_target = masks.mean(dim=[2, 3]).unsqueeze(1)
+                    if cls_target.shape != cls_logits.shape:
+                        cls_target = cls_target.squeeze(-1)
+                    cls_loss = F.binary_cross_entropy_with_logits(cls_logits, cls_target)
+                else:
+                    cls_loss = 0
+                loss = seg_loss + 0.05 * cls_loss if cls_logits is not None else seg_loss
+                
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=Config.MAX_GRAD_NORM)
+                optimizer.step()
 
-            prev_outputs = seg_logits.detach()
+            if torch.isnan(loss) or torch.isinf(loss):
+                continue
 
-            with torch.no_grad():
-                seg_output = torch.sigmoid(seg_logits)
-                dice = dice_coefficient(seg_output, final_masks).item()
-                iou = iou_pytorch(seg_output, final_masks).mean().item()
-                acc = accuracy(seg_output > 0.5, final_masks).item()
+            # Calculate metrics every few batches for speed - OPTIMIZED
+            if batch_idx % 5 == 0:  # Calculate metrics every 5 batches for speed
+                with torch.no_grad():
+                    seg_output = torch.sigmoid(seg_logits.clamp(min=-20, max=20))
+                    dice = dice_coefficient(seg_output, masks).item()
+                    iou  = iou_pytorch(seg_output, masks).mean().item()
+                    acc  = accuracy(seg_output > 0.5, masks).item()
 
-            train_logger.update(
-                images.size(0),
-                loss=loss.item(),
-                dice=dice,
-                iou=iou,
-                acc=acc
-            )
-
-            pbar.set_postfix(loss=loss.item(), dice=dice)
+                train_logger.update(
+                    images.size(0),
+                    loss=loss.item(),
+                    dice=dice,
+                    iou=iou,
+                    acc=acc
+                )
+            else:
+                # Just update loss for speed
+                train_logger.update(
+                    images.size(0),
+                    loss=loss.item(),
+                    dice=0,  # Will be averaged correctly
+                    iou=0,   # Will be averaged correctly
+                    acc=0    # Will be averaged correctly
+                )
+            
+            pbar.set_postfix(loss=f'{loss.item():.4f}')
 
         avg_train = train_logger.avg()
         logger.info(
@@ -289,8 +400,17 @@ def train_model(dataset_names):
             f"IoU={avg_train['iou']:.4f} | "
             f"Acc={avg_train['acc']:.4f}"
         )
+        
+        # TensorBoard logging
+        if writer and hasattr(writer, 'add_scalar'):
+            writer.add_scalar('Loss/Train', avg_train['loss'], epoch)
+            writer.add_scalar('Dice/Train', avg_train['dice'], epoch)
+            writer.add_scalar('IoU/Train', avg_train['iou'], epoch)
+            writer.add_scalar('Accuracy/Train', avg_train['acc'], epoch)
+        
         log_vram_usage()
 
+        # VALIDATION - OPTIMIZED FOR SPEED
         val_logger.reset()
         model.eval()
         with torch.no_grad():
@@ -302,20 +422,25 @@ def train_model(dataset_names):
                 dynamic_ncols=True,
                 smoothing=0.1
             )
-
             for _, batch in val_pbar:
                 batch = move_to_device(batch, Config.DEVICE)
 
                 images = batch.get("image")
-                masks = batch.get("mask")
+                masks  = batch.get("mask")
 
-                _, seg_logits = model(images)
-                seg_output = torch.sigmoid(seg_logits)
+                # Fast validation with mixed precision - OPTIMIZED
+                if Config.USE_AMP:
+                    with autocast("cuda"):
+                        cls_logits, seg_logits = model(images)
+                else:
+                    cls_logits, seg_logits = model(images)
+                
+                seg_output = torch.sigmoid(seg_logits.clamp(min=-20, max=20))
 
-                loss = criterion(seg_logits, masks).item()
-                dice = dice_coefficient(seg_output, masks).item()
-                iou = iou_pytorch(seg_output, masks).mean().item()
-                acc = accuracy(seg_output > 0.5, masks).item()
+                loss    = criterion(seg_logits, masks).item()
+                dice    = dice_coefficient(seg_output, masks).item()
+                iou     = iou_pytorch(seg_output, masks).mean().item()
+                acc     = accuracy(seg_output > 0.5, masks).item()
                 p, r, f1 = precision_recall_f1(seg_output > 0.5, masks)
 
                 val_logger.update(
@@ -330,8 +455,6 @@ def train_model(dataset_names):
                 )
                 val_pbar.set_postfix({'loss': f'{loss:.4f}', 'dice': f'{dice:.4f}'})
 
-
-        # Log validation metrics
         avg_val = val_logger.avg()
         logger.info(
             f"📊 Epoch {epoch} Validation: "
@@ -343,8 +466,20 @@ def train_model(dataset_names):
             f"Recall={avg_val['recall']:.4f} | "
             f"F1={avg_val['f1']:.4f}"
         )
+        
+        # TensorBoard logging
+        if writer and hasattr(writer, 'add_scalar'):
+            writer.add_scalar('Loss/Val', avg_val['loss'], epoch)
+            writer.add_scalar('Dice/Val', avg_val['dice'], epoch)
+            writer.add_scalar('IoU/Val', avg_val['iou'], epoch)
+            writer.add_scalar('Accuracy/Val', avg_val['acc'], epoch)
+            writer.add_scalar('Precision/Val', avg_val['precision'], epoch)
+            writer.add_scalar('Recall/Val', avg_val['recall'], epoch)
+            writer.add_scalar('F1/Val', avg_val['f1'], epoch)
+        
         log_vram_usage()
-        # Save to CSV
+
+        # Append to CSV
         with open(csv_log_path, "a") as f:
             writer = csv.writer(f)
             writer.writerow([
@@ -353,45 +488,48 @@ def train_model(dataset_names):
                 f"{avg_train['iou']:.4f}", f"{avg_train['acc']:.4f}",
                 f"{avg_val['loss']:.4f}", f"{avg_val['dice']:.4f}",
                 f"{avg_val['iou']:.4f}", f"{avg_val['acc']:.4f}",
-                f"{avg_val['precision']:.4f}", f"{avg_val['recall']:.4f}", f"{avg_val['f1']:.4f}"
+                f"{avg_val['precision']:.4f}", f"{avg_val['recall']:.4f}",
+                f"{avg_val['f1']:.4f}"
             ])
 
+        # EARLY STOPPING & CHECKPOINTING
         if avg_val['loss'] < best_val_loss:
             best_val_loss = avg_val['loss']
+            epochs_no_improve = 0
             save_checkpoint({
                 "epoch": epoch,
-                "state_dict": model.state_dict(),
+                "model_state_dict": model.state_dict(),
                 "optimizer": optimizer.state_dict(),
                 "best_loss": best_val_loss
             }, filename=checkpoint_path)
             logger.info(f"✅ Saved checkpoint with ValLoss={best_val_loss:.4f} at '{checkpoint_path}'")
+        else:
+            epochs_no_improve += 1
+            if epochs_no_improve >= Config.EARLY_STOPPING_PATIENCE:
+                logger.info(f"🛑 Early stopping triggered at epoch {epoch}")
+                break
 
         scheduler.step()
 
-        # Testing
+    # ── TESTING ──
     if test_loader is not None:
         logger.info("🧪 Evaluating on test set...")
         test_logger = MetricLogger(["loss", "dice", "iou", "acc", "precision", "recall", "f1"])
+        
         model.eval()
         with torch.no_grad():
-            test_pbar = tqdm(
-                enumerate(test_loader),
-                desc="Test Evaluation",
-                total=len(test_loader),
-                leave=True,
-                dynamic_ncols=True,
-                smoothing=0.1
-            )
-
-            for _, batch in test_pbar:
-                log_vram_usage()  # ✅ Log VRAM during test
+            for batch in tqdm(test_loader, desc="Testing"):
                 batch = move_to_device(batch, Config.DEVICE)
-
                 images = batch.get("image")
                 masks = batch.get("mask")
 
-                _, seg_logits = model(images)
-                seg_output = torch.sigmoid(seg_logits)
+                if Config.USE_AMP:
+                    with autocast("cuda"):
+                        cls_logits, seg_logits = model(images)
+                else:
+                    cls_logits, seg_logits = model(images)
+
+                seg_output = torch.sigmoid(seg_logits.clamp(min=-20, max=20))
 
                 loss = criterion(seg_logits, masks).item()
                 dice = dice_coefficient(seg_output, masks).item()
@@ -409,11 +547,10 @@ def train_model(dataset_names):
                     recall=r,
                     f1=f1
                 )
-                test_pbar.set_postfix({'loss': f'{loss:.4f}', 'dice': f'{dice:.4f}'})
 
         avg_test = test_logger.avg()
         logger.info(
-            f"🧪 Test Metrics: "
+            f"🎯 Final Test Results: "
             f"Loss={avg_test['loss']:.4f} | "
             f"Dice={avg_test['dice']:.4f} | "
             f"IoU={avg_test['iou']:.4f} | "
@@ -423,37 +560,26 @@ def train_model(dataset_names):
             f"F1={avg_test['f1']:.4f}"
         )
 
-        # Save test results to CSV
+        # Save test results
         test_csv_path = os.path.join(Config.LOG_DIR, "test_results.csv")
         with open(test_csv_path, "w") as f:
             writer = csv.writer(f)
             writer.writerow(["Metric", "Value"])
-            for metric, value in avg_test.items():
-                writer.writerow([metric, f"{value:.4f}"])
+            writer.writerow(["Loss", f"{avg_test['loss']:.4f}"])
+            writer.writerow(["Dice", f"{avg_test['dice']:.4f}"])
+            writer.writerow(["IoU", f"{avg_test['iou']:.4f}"])
+            writer.writerow(["Accuracy", f"{avg_test['acc']:.4f}"])
+            writer.writerow(["Precision", f"{avg_test['precision']:.4f}"])
+            writer.writerow(["Recall", f"{avg_test['recall']:.4f}"])
+            writer.writerow(["F1", f"{avg_test['f1']:.4f}"])
 
-        # Save sample predictions
-    logger.info("💾 Saving sample predictions...")
-    sample_dir = os.path.join(Config.OUTPUT_DIR, "sample_predictions")
-    os.makedirs(sample_dir, exist_ok=True)
-
-    sample_batch = next(iter(test_loader)) if test_loader else next(iter(valid_loader))
-    sample_batch = move_to_device(sample_batch, Config.DEVICE)
-
-    images = sample_batch["image"]
-    masks = sample_batch["mask"]
-
-    with torch.no_grad():
-        _, seg_logits = model(images)
-        predictions = torch.sigmoid(seg_logits).cpu()
-
-    save_mask_predictions(
-        images.cpu(),
-        masks.cpu(),
-        predictions,
-        out_dir=sample_dir
-    )
-
-    logger.info("🏁 Training completed successfully!")
+    logger.info("🎉 Training completed successfully!")
+    
+    # Close TensorBoard writer properly
+    if writer and hasattr(writer, 'close'):
+        writer.close()
+    
+    return model
 
 
 if __name__ == "__main__":

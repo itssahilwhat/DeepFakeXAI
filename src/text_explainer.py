@@ -1,7 +1,7 @@
 # src/text_explainer.py
 import torch
 import clip
-from config import Config
+from src.config import Config
 from PIL import Image
 import numpy as np
 

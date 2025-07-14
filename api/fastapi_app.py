@@ -1,14 +1,21 @@
 import io
+import os
+import sys
 from fastapi import FastAPI, File, UploadFile
 from fastapi.responses import JSONResponse
 from PIL import Image
 import torch
+import torchvision.transforms as transforms
 import uvicorn
 
-from model import EfficientNetLiteTemporal
-from config import Config
-from utils import save_mask_predictions
-from text_explainer import ArtifactTextExplainer
+import sys
+import os
+sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+
+from src.model import EfficientNetLiteTemporal
+from src.config import Config
+from src.utils import save_mask_predictions
+from src.text_explainer import ArtifactTextExplainer
 
 app = FastAPI()
 model = EfficientNetLiteTemporal(num_classes=1, pretrained=False)
