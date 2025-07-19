@@ -1,3 +1,5 @@
-/data
-/outputs
-/checkpoints
+all_code.txt
+Dockerfile
+README.md
+logs
+data

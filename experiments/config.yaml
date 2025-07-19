@@ -1,0 +1,46 @@
+# Deepfake Detection Config
+
+# Paths
+celebahq_path: data/wacv_data/celebahq
+ffhq_path: data/wacv_data/ffhq
+log_dir: logs/
+checkpoint_dir: logs/checkpoints/
+tensorboard_dir: logs/tensorboard/
+output_dir: outputs/
+onnx_dir: onnx_models/
+
+# Data
+img_size: 224
+batch_size: 16
+num_workers: 4
+pin_memory: true
+shuffle: true
+random_seed: 42
+
+# Model
+backbone: mobilenet_v3_small
+pretrained: true
+dropout: 0.2
+num_classes: 2
+segmentation: true
+attention: false
+
+# Training
+epochs: 10
+learning_rate: 0.001
+weight_decay: 0.0005
+grad_clip: 1.0
+amp: true
+scheduler: cosine
+early_stopping: 5
+grad_accum_steps: 1
+
+# Loss weights
+loss_cls_weight: 1.0
+loss_seg_weight: 1.0
+
+# Augmentation
+aug_strong: true
+jpeg_qualities: [100, 80, 60, 40]
+noise_levels: [0, 5, 10, 20]
+blur_levels: [0, 3, 7] 

@@ -1,8 +1,0 @@
-Metric,Value
-Loss,0.4950
-Dice,0.8699
-IoU,0.7628
-Accuracy,0.7757
-Precision,0.7727
-Recall,0.9984
-F1,0.8699

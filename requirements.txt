@@ -1,32 +1,10 @@
-# Core dependencies
 torch
 torchvision
-numpy
-Pillow
-opencv-python
-tqdm
-
-# API dependencies
 fastapi
 uvicorn
-
-# Explainability tools - Latest versions
-grad-cam
-lime
-shap
-
-# CLIP for advanced explanations
-git+https://github.com/openai/CLIP.git
-
-# Additional utilities
+albumentations
 scikit-learn
-scikit-image
-matplotlib
-seaborn
-scipy
-
-# Optional: for advanced features
-transformers
-
-# Performance optimization
-numba
+pillow
+tqdm
+tensorboard
+numpy 

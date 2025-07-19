@@ -1,133 +1,104 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-import cv2
+import timm
 from src.config import Config
-import numpy as np
-from torchvision.models import efficientnet_b0, EfficientNet_B0_Weights
-import torch.nn.functional as F
 
-
-class LightweightConvBlock(nn.Module):
-    """Ultra-lightweight convolution block for speed"""
-    def __init__(self, in_ch, out_ch):
-        super(LightweightConvBlock, self).__init__()
+class DecoderBlock(nn.Module):
+    """
+    A U-Net-style decoder block.
+    It takes features from a lower level, upsamples them, and concatenates them
+    with skip-connection features from the corresponding encoder level.
+    """
+    def __init__(self, in_channels, skip_channels, out_channels):
+        super().__init__()
+        # Upsample the input feature map to double its height and width
+        self.upsample = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
+        # A convolutional block to process the concatenated features
         self.conv = nn.Sequential(
-            nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(out_ch),
-            nn.ReLU6(inplace=True)  # ReLU6 for efficiency
+            nn.Conv2d(in_channels + skip_channels, out_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True)
         )
 
-    def forward(self, x):
+    def forward(self, x, skip_features):
+        """
+        Args:
+            x (torch.Tensor): The input tensor from the previous (deeper) decoder block.
+            skip_features (torch.Tensor): The skip-connection tensor from the corresponding encoder stage.
+        """
+        x = self.upsample(x)
+        x = torch.cat([x, skip_features], dim=1)
         return self.conv(x)
 
+class MultiTaskDeepfakeModel(nn.Module):
+    """
+    The final, definitive multi-task model with a U-Net decoder for segmentation.
+    """
+    def __init__(self, backbone_name=Config.BACKBONE, num_classes=Config.NUM_CLASSES, pretrained=Config.PRETRAINED, dropout=Config.DROPOUT, segmentation=Config.SEGMENTATION, **kwargs):
+        super().__init__()
+        self.segmentation = segmentation
 
-class FastDecoder(nn.Module):
-    """Ultra-fast decoder for segmentation"""
-    def __init__(self, in_channels=1280):  # Fixed: EfficientNet outputs 1280 channels
-        super(FastDecoder, self).__init__()
-        # Minimal decoder for speed
-        self.up1 = nn.ConvTranspose2d(in_channels, 256, 2, 2)
-        self.conv1 = LightweightConvBlock(256, 256)
-        
-        self.up2 = nn.ConvTranspose2d(256, 128, 2, 2)
-        self.conv2 = LightweightConvBlock(128, 128)
-        
-        self.up3 = nn.ConvTranspose2d(128, 64, 2, 2)
-        self.conv3 = LightweightConvBlock(64, 64)
-        
-        self.up4 = nn.ConvTranspose2d(64, 32, 2, 2)
-        self.conv4 = LightweightConvBlock(32, 32)
-        
-    def forward(self, x):
-        x = self.up1(x)
-        x = self.conv1(x)
-        x = self.up2(x)
-        x = self.conv2(x)
-        x = self.up3(x)
-        x = self.conv3(x)
-        x = self.up4(x)
-        x = self.conv4(x)
-        return x
-
-
-class EfficientNetLiteTemporal(nn.Module):
-    def __init__(self, num_classes=1, pretrained=True, dropout_rate=None):
-        super(EfficientNetLiteTemporal, self).__init__()
-        
-        dropout_rate = dropout_rate if dropout_rate is not None else Config.DROPOUT_RATE
-
-        # Load EfficientNet-B0 backbone
-        if pretrained:
-            self.backbone = efficientnet_b0(weights=EfficientNet_B0_Weights.IMAGENET1K_V1)
-        else:
-            self.backbone = efficientnet_b0(weights=None)
-        
-        # Remove the classifier
-        self.backbone.classifier = nn.Identity()
-        
-        # XAI-compatible layer for GradCAM (minimal overhead)
-        self.xai_layer = nn.Conv2d(1280, 1280, kernel_size=1, bias=False)  # Fixed: 1280 channels
-        
-        # Fast decoder for segmentation
-        self.decoder = FastDecoder(1280)  # Fixed: 1280 channels
-        
-        # Final segmentation head
-        self.seg_head = nn.Sequential(
-            nn.Conv2d(32, 16, 3, padding=1),  # Fixed: 32 input channels from decoder
-            nn.BatchNorm2d(16),
-            nn.ReLU6(inplace=True),
-            nn.Conv2d(16, num_classes, 1),
-            nn.Sigmoid()
+        # 1. Encoder (Backbone)
+        # We use timm to create the model with `features_only=True` to get intermediate
+        # feature maps, which are essential for the decoder's skip connections.
+        self.backbone = timm.create_model(
+            backbone_name,
+            pretrained=pretrained,
+            features_only=True,
         )
-        
-        # Classification head for dual-head architecture
-        if Config.USE_COLLABORATIVE:
-            self.cls_head = nn.Sequential(
-                nn.AdaptiveAvgPool2d(1),
-                nn.Flatten(),
-                nn.Dropout(dropout_rate),
-                nn.Linear(1280, 256),  # Fixed: 1280 input channels
-                nn.ReLU6(inplace=True),
-                nn.Dropout(dropout_rate),
-                nn.Linear(256, 1),
-                nn.Sigmoid()
-            )
-        
-        # Minimal dropout
-        self.dropout = nn.Dropout2d(dropout_rate)
 
-    def forward(self, x, prev_frames=None, mc_dropout=False):
-        # Extract features from EfficientNet backbone efficiently
-        x = self.backbone.features(x)
+        # Get the number of output channels from each stage of the backbone
+        encoder_channels = self.backbone.feature_info.channels()
+        # Example for 'mobilenetv3_small_100': [16, 16, 24, 48, 576]
 
-        # Apply XAI-compatible layer for GradCAM
-        xai_output = self.xai_layer(x)
+        # 2. Decoder (U-Net Architecture)
+        # The decoder reconstructs the mask by progressively upsampling and refining features.
+        if self.segmentation:
+            # Unpack the channel counts for each encoder stage
+            c0_in, c1_in, c2_in, c3_in, c4_in = encoder_channels
 
-        # Apply minimal dropout
-        x = self.dropout(x) if self.training or mc_dropout else x
+            # Decoder blocks are wired from the deepest features upwards
+            self.decoder4 = DecoderBlock(c4_in, c3_in, 256)
+            self.decoder3 = DecoderBlock(256, c2_in, 128)
+            self.decoder2 = DecoderBlock(128, c1_in, 64)
+            self.decoder1 = DecoderBlock(64, c0_in, 32)
 
-        # Fast decoder
-        x = self.decoder(x)
+            # Final upsampling and a 1x1 convolution to produce the single-channel mask
+            self.seg_upsample = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
+            self.seg_head = nn.Conv2d(32, 1, kernel_size=1)
 
-        # Segmentation output
-        seg_output = self.seg_head(x)
-        seg_output = F.interpolate(seg_output, size=Config.INPUT_SIZE, mode='bilinear', align_corners=False)
+        # 3. Classification Head
+        # This head operates on the deepest, most semantically rich feature map from the encoder.
+        self.cls_head = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+            nn.Dropout(dropout),
+            nn.Linear(encoder_channels[-1], num_classes)
+        )
 
-        # Classification output for dual-head architecture
-        if Config.USE_COLLABORATIVE:
-            # Use the final encoder features for classification
-            cls_features = xai_output  # Use XAI layer output
-            cls_output = self.cls_head(cls_features)
-            return cls_output, seg_output
-        else:
-            return None, seg_output
+    def forward(self, x):
+        # The backbone returns a list of feature maps, from shallowest to deepest
+        encoder_features = self.backbone(x)
 
+        # The classification head uses the final (deepest) feature map for the highest accuracy
+        cls_logits = self.cls_head(encoder_features[-1])
 
-if __name__ == "__main__":
-    # Test the model
-    model = EfficientNetLiteTemporal(pretrained=False, dropout_rate=0.1)
-    dummy_input = torch.randn(2, 3, 224, 224)
-    out = model(dummy_input)
-    print("Model output shape:", out[1].shape if isinstance(out, tuple) else out.shape)
-    print("Model architecture verified successfully")
+        if not self.segmentation:
+            return cls_logits, None
+
+        # Unpack features for the decoder's skip connections
+        c0, c1, c2, c3, c4 = encoder_features
+
+        # Pass features up through the decoder, merging with skip connections at each stage
+        d4 = self.decoder4(c4, c3)      # Start with the deepest features
+        d3 = self.decoder3(d4, c2)
+        d2 = self.decoder2(d3, c1)
+        d1 = self.decoder1(d2, c0)      # End with the shallowest features
+
+        # Produce the final, high-resolution segmentation map
+        seg_logits = self.seg_head(self.seg_upsample(d1))
+
+        return cls_logits, seg_logits
