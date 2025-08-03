@@ -3,3 +3,6 @@ Dockerfile
 README.md
 logs
 data
+wandb
+runs
+outputs
