@@ -1,8 +1,4 @@
-all_code.txt
-Dockerfile
-README.md
-logs
+checkpoints
 data
-wandb
-runs
-outputs
+manifests
+results

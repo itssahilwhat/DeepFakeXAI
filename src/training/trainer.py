@@ -1,195 +1,343 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
-from torch.cuda.amp import autocast, GradScaler
+from torch.amp import autocast, GradScaler
 import sys
 import os
 import numpy as np
+from pathlib import Path
 from sklearn.metrics import precision_recall_fscore_support, roc_auc_score
+from tqdm import tqdm
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from configs.config import lr, epochs, dir_ckpt, seg_loss_w
-from src.models.models import DetectionModel, SegmentationModel
-from src.data.data_utils import get_dataloader
+from src.models.models import DetectionModel, SegmentationModel, HybridDeepfakeModel
+from src.data.clean_dataset import make_clean_loader
 import os
 
 def to_device(model):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     return model.to(device), device
 
-class DetectionTrainer:
-    def __init__(self):
-        self.model, self.device = to_device(DetectionModel())
-        self.opt = AdamW(self.model.parameters(), lr=lr, weight_decay=1e-2)
-        self.sched = CosineAnnealingLR(self.opt, T_max=epochs)
-        self.scaler = GradScaler()
-        self.crit = nn.CrossEntropyLoss()
-        self.best_acc = 0
-        self.best_f1 = 0
-    def train_epoch(self, loader):
-        self.model.train()
-        for x, y, _ in loader:
-            x, y = x.to(self.device), y.to(self.device)
-            self.opt.zero_grad()
-            with autocast():
-                out = self.model(x)
-                loss = self.crit(out, y)
-            self.scaler.scale(loss).backward()
-            self.scaler.step(self.opt)
-            self.scaler.update()
-        self.sched.step()
-    def validate(self, loader):
-        self.model.eval()
-        all_preds = []
-        all_labels = []
-        all_probs = []
-        
-        with torch.no_grad():
-            for x, y, _ in loader:
-                x, y = x.to(self.device), y.to(self.device)
-                out = self.model(x)
-                probs = torch.softmax(out, dim=1)
-                preds = out.argmax(1)
-                
-                all_preds.extend(preds.cpu().numpy())
-                all_labels.extend(y.cpu().numpy())
-                all_probs.extend(probs[:, 1].cpu().numpy())  # Fake class probability
-        
-        # Convert to numpy arrays
-        all_preds = np.array(all_preds)
-        all_labels = np.array(all_labels)
-        all_probs = np.array(all_probs)
-        
-        # Calculate metrics
-        accuracy = (all_preds == all_labels).mean()
-        
-        # Precision, Recall, F1 for Fake class (class 1)
-        precision, recall, f1, _ = precision_recall_fscore_support(
-            all_labels, all_preds, average='binary', zero_division=0
-        )
-        
-        # ROC-AUC
-        try:
-            auc = roc_auc_score(all_labels, all_probs)
-        except ValueError:
-            auc = 0.5  # Fallback if only one class present
-        
-        return {
-            'accuracy': accuracy,
-            'precision': precision,
-            'recall': recall,
-            'f1': f1,
-            'auc': auc
-        }
-    def fit(self):
-        train_loader = get_dataloader('train')
-        val_loader = get_dataloader('val')
-        
-        for epoch in range(epochs):
-            self.train_epoch(train_loader)
-            metrics = self.validate(val_loader)
-            
-            print(f"Epoch {epoch+1}/{epochs}")
-            print(f"  Accuracy: {metrics['accuracy']:.4f}")
-            print(f"  Precision: {metrics['precision']:.4f}")
-            print(f"  Recall: {metrics['recall']:.4f}")
-            print(f"  F1-Score: {metrics['f1']:.4f}")
-            print(f"  ROC-AUC: {metrics['auc']:.4f}")
-            
-            # Save best model based on F1-score (better than accuracy for imbalanced data)
-            if metrics['f1'] > self.best_f1:
-                self.best_f1 = metrics['f1']
-                torch.save(self.model.state_dict(), os.path.join(dir_ckpt, 'detect.pth'))
-                print(f"  ✓ New best model saved (F1: {metrics['f1']:.4f})")
-            print()
+def dice_loss(pred, target, smooth=1e-6):
+    """Compute Dice loss"""
+    pred = torch.sigmoid(pred)
+    intersection = (pred * target).sum()
+    dice = (2. * intersection + smooth) / (pred.sum() + target.sum() + smooth)
+    return 1 - dice
 
 class SegmentationTrainer:
-    def __init__(self):
-        self.model, self.device = to_device(SegmentationModel())
-        self.opt = AdamW(self.model.parameters(), lr=lr, weight_decay=1e-2)
-        self.sched = CosineAnnealingLR(self.opt, T_max=epochs)
-        self.scaler = GradScaler()
-        self.crit = nn.BCEWithLogitsLoss(reduction='none')
-        self.best_iou = 0
-    def train_epoch(self, loader):
+    def __init__(self, model, train_loader, val_loader, optimizer, scheduler, device, checkpoint_dir, patience=5, resume_from=None):
+        self.model = model
+        self.train_loader = train_loader
+        self.val_loader = val_loader
+        self.optimizer = optimizer
+        self.scheduler = scheduler
+        self.device = device
+        self.checkpoint_dir = Path(checkpoint_dir)
+        self.patience = patience
+        
+        # Training state
+        self.best_iou = 0.0
+        self.best_dice = 0.0
+        self.best_pixel_acc = 0.0
+        self.patience_counter = 0
+        self.start_epoch = 0
+        self.scaler = GradScaler('cuda') if torch.cuda.is_available() else None
+        
+        # Loss functions - Focal BCE + Dice
+        self.focal_criterion = self.focal_bce_loss
+        self.dice_criterion = self.dice_loss
+        
+        # Create checkpoint directory
+        self.checkpoint_dir.mkdir(exist_ok=True)
+        
+        # Resume from checkpoint if specified
+        if resume_from:
+            self.load_checkpoint(resume_from)
+        else:
+            # Try to load from latest checkpoint
+            self.load_latest_checkpoint()
+        
+    def dice_loss(self, pred, target, smooth=1e-6):
+        """Compute Dice loss"""
+        pred = torch.sigmoid(pred)
+        intersection = (pred * target).sum()
+        dice = (2. * intersection + smooth) / (pred.sum() + target.sum() + smooth)
+        return 1 - dice
+    
+    def focal_bce_loss(self, pred, target, alpha=0.25, gamma=2.0):
+        """Focal BCE loss to focus on hard examples"""
+        bce_loss = F.binary_cross_entropy_with_logits(pred, target, reduction='none')
+        pt = torch.exp(-bce_loss)
+        focal_loss = alpha * (1 - pt) ** gamma * bce_loss
+        return focal_loss.mean()
+    
+    def train_epoch(self, epoch):
         self.model.train()
-        for x, _, mask in loader:
-            x = x.to(self.device)
-            mask = mask.to(self.device)
-            self.opt.zero_grad()
-            with autocast():
-                out = self.model(x)
-                # Only compute loss on non-empty masks
-                loss_per_pixel = self.crit(out, mask)
-                # Average over valid pixels (where mask > 0)
-                valid_pixels = (mask > 0).float()
-                if valid_pixels.sum() > 0:
-                    loss = (loss_per_pixel * valid_pixels).sum() / valid_pixels.sum()
+        total_loss = 0.0
+        num_batches = 0
+        
+        pbar = tqdm(self.train_loader, desc=f"Epoch {epoch+1} [Train]")
+        for batch_idx, batch in enumerate(pbar):
+            if len(batch) == 3:
+                images, masks, labels = batch
+            else:
+                images, labels, paths = batch
+                # Skip if no masks available
+                continue
+                
+            images = images.to(self.device)
+            masks = masks.to(self.device)
+            
+            self.optimizer.zero_grad()
+            
+            if self.scaler:
+                with autocast('cuda'):
+                    outputs = self.model(images)
+                    # Handle multi-scale outputs (UNet training mode may return a tuple)
+                    if isinstance(outputs, (tuple, list)):
+                        outputs = tuple(torch.clamp(out, -20, 20) for out in outputs)
+                        out_main, out_2x, out_4x = outputs
+                        # Resize GT masks to match each scale using nearest to preserve binarity
+                        mask_main = F.interpolate(masks, size=out_main.shape[-2:], mode='nearest')
+                        mask_2x = F.interpolate(masks, size=out_2x.shape[-2:], mode='nearest')
+                        mask_4x = F.interpolate(masks, size=out_4x.shape[-2:], mode='nearest')
+                        # Compute weighted multi-scale loss
+                        loss_main = self.focal_criterion(out_main, mask_main) + self.dice_criterion(out_main, mask_main)
+                        loss_2x = self.focal_criterion(out_2x, mask_2x) + self.dice_criterion(out_2x, mask_2x)
+                        loss_4x = self.focal_criterion(out_4x, mask_4x) + self.dice_criterion(out_4x, mask_4x)
+                        loss = 1.0 * loss_main + 0.5 * loss_2x + 0.25 * loss_4x
+                    else:
+                        # Clamp outputs to prevent extreme logits
+                        outputs = torch.clamp(outputs, -20, 20)
+                        # Focal BCE + Dice loss
+                        loss = self.focal_criterion(outputs, masks) + self.dice_criterion(outputs, masks)
+                
+                self.scaler.scale(loss).backward()
+                # Gradient clipping before unscaling
+                self.scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+            else:
+                outputs = self.model(images)
+                if isinstance(outputs, (tuple, list)):
+                    outputs = tuple(torch.clamp(out, -20, 20) for out in outputs)
+                    out_main, out_2x, out_4x = outputs
+                    mask_main = F.interpolate(masks, size=out_main.shape[-2:], mode='nearest')
+                    mask_2x = F.interpolate(masks, size=out_2x.shape[-2:], mode='nearest')
+                    mask_4x = F.interpolate(masks, size=out_4x.shape[-2:], mode='nearest')
+                    loss_main = self.focal_criterion(out_main, mask_main) + self.dice_criterion(out_main, mask_main)
+                    loss_2x = self.focal_criterion(out_2x, mask_2x) + self.dice_criterion(out_2x, mask_2x)
+                    loss_4x = self.focal_criterion(out_4x, mask_4x) + self.dice_criterion(out_4x, mask_4x)
+                    loss = 1.0 * loss_main + 0.5 * loss_2x + 0.25 * loss_4x
                 else:
-                    loss = loss_per_pixel.mean()  # Fallback for empty masks
-            self.scaler.scale(loss).backward()
-            self.scaler.step(self.opt)
-            self.scaler.update()
-        self.sched.step()
-    def validate(self, loader):
+                    outputs = torch.clamp(outputs, -20, 20)
+                    loss = self.focal_criterion(outputs, masks) + self.dice_criterion(outputs, masks)
+                
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                self.optimizer.step()
+            
+            total_loss += loss.item()
+            num_batches += 1
+            
+            # Update progress bar
+            pbar.set_postfix({'Loss': f'{loss.item():.4f}'})
+        
+        return total_loss / num_batches if num_batches > 0 else 0.0
+    
+    def validate(self):
+        """Validate the model"""
         self.model.eval()
-        iou_scores = []
-        dice_scores = []
-        pixel_accuracies = []
+        total_iou = 0.0
+        total_dice = 0.0
+        total_pixel_acc = 0.0
+        num_samples = 0
         
         with torch.no_grad():
-            for x, _, mask in loader:
-                x = x.to(self.device)
-                mask = mask.to(self.device)
-                out = self.model(x)
-                pred = (torch.sigmoid(out) > 0.5).float()
+            pbar = tqdm(self.val_loader, desc="Validation")
+            for batch_idx, batch in enumerate(pbar):
+                if len(batch) == 3:
+                    images, masks, labels = batch
+                else:
+                    images, labels, paths = batch
+                    continue
                 
-                # Only compute metrics on non-empty masks
-                if mask.sum() > 0:
+                images = images.to(self.device)
+                masks = masks.to(self.device)
+                
+                outputs = self.model(images)
+                
+                # Handle multi-scale outputs
+                if isinstance(outputs, (tuple, list)):
+                    outputs = outputs[0]  # Use main output for validation
+                
+                # Convert to binary predictions
+                pred_masks = torch.sigmoid(outputs) > 0.5
+                
+                # Compute metrics
+                for i in range(images.size(0)):
+                    pred = pred_masks[i]
+                    target = masks[i] > 0.5
+                    
                     # IoU
-                    inter = (pred * mask).sum().item()
-                    union = (pred + mask).clamp(0,1).sum().item()
-                    iou = inter / (union + 1e-8)
-                    iou_scores.append(iou)
+                    intersection = (pred & target).sum()
+                    union = (pred | target).sum()
+                    iou = intersection / union if union > 0 else 0.0
                     
                     # Dice
-                    dice = 2*inter / (pred.sum().item() + mask.sum().item() + 1e-8)
-                    dice_scores.append(dice)
+                    dice = (2 * intersection) / (pred.sum() + target.sum()) if (pred.sum() + target.sum()) > 0 else 0.0
                     
-                    # Pixel Accuracy
-                    correct_pixels = ((pred == mask) & (mask > 0)).sum().item()
-                    total_pixels = (mask > 0).sum().item()
-                    pixel_acc = correct_pixels / (total_pixels + 1e-8)
-                    pixel_accuracies.append(pixel_acc)
+                    # Pixel accuracy
+                    pixel_acc = (pred == target).float().mean()
+                    
+                    total_iou += iou
+                    total_dice += dice
+                    total_pixel_acc += pixel_acc
+                    num_samples += 1
+                
+                # Update progress bar
+                pbar.set_postfix({
+                    'IoU': f'{total_iou/num_samples:.4f}',
+                    'Dice': f'{total_dice/num_samples:.4f}'
+                })
         
-        # Calculate averages
-        avg_iou = np.mean(iou_scores) if iou_scores else 0
-        avg_dice = np.mean(dice_scores) if dice_scores else 0
-        avg_pixel_acc = np.mean(pixel_accuracies) if pixel_accuracies else 0
-        
+        # Return average metrics
         return {
-            'iou': avg_iou,
-            'dice': avg_dice,
-            'pixel_accuracy': avg_pixel_acc,
-            'num_samples': len(iou_scores)
+            'iou': total_iou / num_samples if num_samples > 0 else 0.0,
+            'dice': total_dice / num_samples if num_samples > 0 else 0.0,
+            'pixel_acc': total_pixel_acc / num_samples if num_samples > 0 else 0.0,
+            'num_samples': num_samples
         }
-    def fit(self):
-        train_loader = get_dataloader('train')
-        val_loader = get_dataloader('val')
+    
+    def save_checkpoint(self, epoch, metrics, is_best=False):
+        """Save checkpoint"""
+        checkpoint = {
+            'epoch': epoch,
+            'model_state_dict': self.model.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'scheduler_state_dict': self.scheduler.state_dict(),
+            'best_iou': self.best_iou,
+            'best_dice': self.best_dice,
+            'best_pixel_acc': self.best_pixel_acc,
+            'metrics': metrics
+        }
         
-        for epoch in range(epochs):
-            self.train_epoch(train_loader)
-            metrics = self.validate(val_loader)
+        # Save latest checkpoint
+        latest_path = self.checkpoint_dir / 'seg_latest.pth'
+        torch.save(checkpoint, latest_path)
+        
+        # Save best checkpoint if improved
+        if is_best:
+            best_path = self.checkpoint_dir / 'seg_best.pth'
+            torch.save(checkpoint, best_path)
+            print(f"🏆 New best model saved! IoU: {metrics['iou']:.4f}")
+        
+        # Save epoch checkpoint
+        epoch_path = self.checkpoint_dir / f'seg_epoch_{epoch+1}.pth'
+        torch.save(checkpoint, epoch_path)
+    
+    def load_checkpoint(self, checkpoint_path):
+        """Load checkpoint from specific path"""
+        if not Path(checkpoint_path).exists():
+            print(f"⚠️  Checkpoint not found: {checkpoint_path}")
+            return False
             
-            print(f"Epoch {epoch+1}/{epochs}")
-            print(f"  IoU: {metrics['iou']:.4f}")
-            print(f"  Dice: {metrics['dice']:.4f}")
-            print(f"  Pixel Accuracy: {metrics['pixel_accuracy']:.4f}")
-            print(f"  Samples with masks: {metrics['num_samples']}")
+        print(f"📂 Loading checkpoint from: {checkpoint_path}")
+        try:
+            # Try loading with weights_only=False for backward compatibility
+            checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
+        except Exception as e:
+            print(f"⚠️  Failed to load checkpoint: {e}")
+            print(f"   Starting fresh training instead...")
+            return False
+        
+        self.model.load_state_dict(checkpoint['model_state_dict'])
+        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        
+        self.start_epoch = checkpoint['epoch'] + 1
+        self.best_iou = checkpoint.get('best_iou', 0.0)
+        self.best_dice = checkpoint.get('best_dice', 0.0)
+        self.best_pixel_acc = checkpoint.get('best_pixel_acc', 0.0)
+        
+        print(f"✅ Resumed from epoch {checkpoint['epoch']+1}")
+        print(f"   Best IoU: {self.best_iou:.4f}")
+        print(f"   Best Dice: {self.best_dice:.4f}")
+        return True
+    
+    def load_latest_checkpoint(self):
+        """Load from latest checkpoint if available"""
+        latest_path = self.checkpoint_dir / 'seg_latest.pth'
+        if latest_path.exists():
+            print(f"📂 Found latest checkpoint, resuming training...")
+            return self.load_checkpoint(latest_path)
+        else:
+            print(f"📂 No previous checkpoint found, starting fresh training")
+            return False
+    
+    def fit(self, num_epochs, stage='stage2'):
+        print(f"\n🚀 Starting segmentation training for {num_epochs} epochs")
+        print(f"   Stage: {stage}")
+        print(f"   Device: {self.device}")
+        print(f"   Early stopping patience: {self.patience}")
+        print(f"   Starting from epoch: {self.start_epoch + 1}")
+        
+        for epoch in range(self.start_epoch, num_epochs):
+            print(f"\n{'='*60}")
+            print(f"EPOCH {epoch+1}/{num_epochs}")
+            print(f"{'='*60}")
             
-            if metrics['iou'] > self.best_iou:
-                self.best_iou = metrics['iou']
-                torch.save(self.model.state_dict(), os.path.join(dir_ckpt, 'seg.pth'))
-                print(f"  ✓ New best model saved (IoU: {metrics['iou']:.4f})")
-            print()
+            # Training
+            train_loss = self.train_epoch(epoch)
+            
+            # Validation
+            val_metrics = self.validate()
+            
+            # Learning rate step
+            self.scheduler.step()
+            current_lr = self.scheduler.get_last_lr()[0]
+            
+            # Print results
+            print(f"\n📊 EPOCH {epoch+1} RESULTS:")
+            print(f"{'─'*40}")
+            print(f"🎯 Training Loss:     {train_loss:.4f}")
+            print(f"🔍 Validation Metrics:")
+            print(f"  IoU:               {val_metrics['iou']:.4f}")
+            print(f"  Dice:              {val_metrics['dice']:.4f}")
+            print(f"  Pixel Accuracy:    {val_metrics['pixel_acc']:.4f}")
+            print(f"  Samples processed: {val_metrics['num_samples']}")
+            print(f"📚 Learning Rate:     {current_lr:.6f}")
+            
+            # Check for improvement
+            current_iou = val_metrics['iou']
+            is_best = current_iou > self.best_iou
+            
+            if is_best:
+                self.best_iou = current_iou
+                self.best_dice = val_metrics['dice']
+                self.best_pixel_acc = val_metrics['pixel_acc']
+                self.patience_counter = 0
+            else:
+                self.patience_counter += 1
+            
+            # Save checkpoint
+            self.save_checkpoint(epoch, val_metrics, is_best)
+            
+            # Early stopping
+            if self.patience_counter >= self.patience:
+                print(f"\n⏰ Early stopping triggered after {self.patience} epochs without improvement")
+                break
+            
+            print(f"🏆 Best IoU so far: {self.best_iou:.4f} (patience: {self.patience_counter}/{self.patience})")
+        
+        # Return best metrics
+        return {
+            'iou': self.best_iou,
+            'dice': self.best_dice,
+            'pixel_acc': self.best_pixel_acc
+        }

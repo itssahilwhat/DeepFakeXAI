@@ -4,7 +4,11 @@ timm
 pandas
 Pillow
 numpy
+matplotlib
+seaborn
 grad-cam
 lime
+scikit-learn
+tqdm
 opencv-python
-scikit-learn 
+shap

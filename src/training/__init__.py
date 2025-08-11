@@ -1,3 +1,3 @@
-from .trainer import DetectionTrainer, SegmentationTrainer
+from .trainer import SegmentationTrainer
 
-__all__ = ['DetectionTrainer', 'SegmentationTrainer'] 
+__all__ = ['SegmentationTrainer'] 
