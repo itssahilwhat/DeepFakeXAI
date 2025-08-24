@@ -9,40 +9,35 @@ from sklearn.metrics import roc_auc_score
 import cv2
 from PIL import Image
 
+# ============================================================================
+# GRAD-CAM EXPLANATION
+# ============================================================================
+
 def explain_gradcam(det_model, img_tensor, cls):
+    """Generate Grad-CAM explanation for a given class"""
     det_model.eval()
 
-    # Create a proper wrapper for hybrid models
-    if hasattr(det_model, 'get_feature_map'):
-        class HybridModelWrapper:
-            def __init__(self, model):
-                self.model = model
-                self.eval = lambda: None
-            def __call__(self, x):
-                logits_cls, _, _ = self.model(x)
-                return logits_cls
-            def parameters(self):
-                return self.model.parameters()
-        wrapped_model = HybridModelWrapper(det_model)
-        target_layer = det_model.adapter
-        cam = GradCAM(model=wrapped_model, target_layers=[target_layer])
+    # Handle regular detection models (VanillaCNN)
+    if hasattr(det_model, 'encoder'):
+        # Use last conv layer in encoder (VanillaCNN)
+        conv_layers = [m for m in det_model.encoder.modules() if isinstance(m, torch.nn.Conv2d)]
+        if not conv_layers:
+            raise AttributeError('No Conv2d layers found in model.encoder for Grad-CAM')
+        target_layer = conv_layers[-1]
     else:
-        # Regular detection model
-        if hasattr(det_model, 'encoder'):
-            # Use last conv in encoder (VanillaCNN path)
-            conv_layers = [m for m in det_model.encoder.modules() if isinstance(m, torch.nn.Conv2d)]
-            if not conv_layers:
-                raise AttributeError('No Conv2d layers found in model.encoder for Grad-CAM')
-            target_layer = conv_layers[-1]
-        elif hasattr(det_model, 'net'):
-            # timm model path
-            target_layer = det_model.net.features[-1]
-        else:
-            raise AttributeError('Unsupported model type for Grad-CAM: expected encoder or net')
-        cam = GradCAM(model=det_model, target_layers=[target_layer])
+        raise AttributeError('Unsupported model type for Grad-CAM: expected encoder attribute')
+    
+    cam = GradCAM(model=det_model, target_layers=[target_layer])
 
+    # Generate Grad-CAM heatmap
     grayscale_cam = cam(input_tensor=img_tensor.unsqueeze(0), targets=[ClassifierOutputTarget(cls)])[0]
+    
+    # Normalize to [0, 1] range
     return (grayscale_cam - grayscale_cam.min()) / (grayscale_cam.max() - grayscale_cam.min() + 1e-8)
+
+# ============================================================================
+# LIME EXPLANATION
+# ============================================================================
 
 def explain_lime(
     predict_fn,
@@ -53,84 +48,90 @@ def explain_lime(
     hide_rest: bool = True,
     silent: bool = True,
 ):
+    """Generate LIME explanation using superpixel segmentation"""
     explainer = lime_image.LimeImageExplainer()
-    # Normalize image for LIME (0-1 range)
+    
+    # Normalize image to [0, 1] range for LIME
     img_normalized = img_np.astype(np.float32) / 255.0
+    
+    # Generate explanation (with optional silent mode)
     if silent:
         fnull = io.StringIO()
         with contextlib.redirect_stdout(fnull), contextlib.redirect_stderr(fnull):
             exp = explainer.explain_instance(img_normalized, predict_fn, num_samples=num_samples)
     else:
         exp = explainer.explain_instance(img_normalized, predict_fn, num_samples=num_samples)
+    
+    # Extract mask for top predicted class
     _, mask = exp.get_image_and_mask(
         exp.top_labels[0],
         positive_only=positive_only,
         hide_rest=hide_rest,
         num_features=num_features,
     )
+    
+    # Convert to binary mask
     return (mask > 0).astype(np.float32)
 
+# ============================================================================
+# UTILITY FUNCTIONS
+# ============================================================================
+
 def overlay_numpy(img, mask, alpha=0.5):
+    """Overlay heatmap on image"""
+    # Normalize image to [0, 1] if needed
     img = img.astype(np.float32) / 255 if img.max() > 1 else img.astype(np.float32)
+    
+    # Stack mask to 3 channels
     mask = np.stack([mask]*3, -1)
+    
+    # Blend image and mask
     return np.clip(img * (1 - alpha) + mask * alpha, 0, 1)
+
+# ============================================================================
+# FIDELITY METRICS
+# ============================================================================
 
 def compute_fidelity_deletion(model, img_tensor, heatmap, target_class, steps=10):
     """
     Compute deletion fidelity: how much confidence drops when removing top-k% of heatmap
     Returns AUC of confidence vs percentage of heatmap removed
     """
-    # Handle hybrid model vs regular model
-    if hasattr(model, 'get_feature_map'):
-        # Hybrid model
-        class ModelWrapper:
-            def __init__(self, model):
-                self.model = model
-            def __call__(self, x):
-                logits_cls, _, _ = self.model(x)
-                return logits_cls
-        wrapped_model = ModelWrapper(model)
-        original_conf = torch.softmax(wrapped_model(img_tensor.unsqueeze(0)), dim=1)[0, target_class].item()
-    else:
-        # Regular detection model
-        original_conf = torch.softmax(model(img_tensor.unsqueeze(0)), dim=1)[0, target_class].item()
+    # Regular detection model (VanillaCNN)
+    original_conf = torch.softmax(model(img_tensor.unsqueeze(0)), dim=1)[0, target_class].item()
     
-    # Sort heatmap values
+    # Sort heatmap values (highest to lowest)
     flat_heatmap = heatmap.flatten()
-    sorted_indices = np.argsort(flat_heatmap)[::-1]  # Descending order
+    sorted_indices = np.argsort(flat_heatmap)[::-1]
     
     confidences = []
     percentages = np.linspace(0, 1, steps)
-    
-    # Get device for consistent tensor operations
     device = img_tensor.device
     
+    # Test different percentages of heatmap removal
     for pct in percentages:
-        # Create masked image
+        # Create mask for current percentage
         mask = np.ones_like(heatmap)
         n_pixels_to_mask = int(pct * len(flat_heatmap))
+        
         if n_pixels_to_mask > 0:
             indices_to_mask = sorted_indices[:n_pixels_to_mask]
             mask_flat = np.ones(len(flat_heatmap))
             mask_flat[indices_to_mask] = 0
             mask = mask_flat.reshape(heatmap.shape)
         
-        # Apply mask to image - convert mask to tensor and move to same device
+        # Apply mask to image
         masked_img = img_tensor.clone()
         mask_tensor = torch.from_numpy(mask).unsqueeze(0).to(device)
         masked_img = masked_img * mask_tensor
         
-        # Get confidence
+        # Get confidence for masked image
         with torch.no_grad():
-            if hasattr(model, 'get_feature_map'):
-                # Hybrid model
-                conf = torch.softmax(wrapped_model(masked_img.unsqueeze(0)), dim=1)[0, target_class].item()
-            else:
-                # Regular detection model
-                conf = torch.softmax(model(masked_img.unsqueeze(0)), dim=1)[0, target_class].item()
+            conf = torch.softmax(model(masked_img.unsqueeze(0)), dim=1)[0, target_class].item()
+        
         confidences.append(conf)
     
-    # Compute AUC using numeric integration (area under confidence vs percentage curve)
+    # Compute AUC (area under confidence vs percentage curve)
     # Higher AUC means confidence drops quickly when removing important regions
     auc = np.trapz(confidences, percentages)
     
@@ -140,20 +141,8 @@ def compute_sensitivity_n(model, img_tensor, heatmap, target_class, n_percent=10
     """
     Compute sensitivity-n: how much prediction changes when perturbing top-n% regions
     """
-    # Handle hybrid model vs regular model
-    if hasattr(model, 'get_feature_map'):
-        # Hybrid model
-        class ModelWrapper:
-            def __init__(self, model):
-                self.model = model
-            def __call__(self, x):
-                logits_cls, _, _ = self.model(x)
-                return logits_cls
-        wrapped_model = ModelWrapper(model)
-        original_conf = torch.softmax(wrapped_model(img_tensor.unsqueeze(0)), dim=1)[0, target_class].item()
-    else:
-        # Regular detection model
-        original_conf = torch.softmax(model(img_tensor.unsqueeze(0)), dim=1)[0, target_class].item()
+    # Regular detection model (VanillaCNN)
+    original_conf = torch.softmax(model(img_tensor.unsqueeze(0)), dim=1)[0, target_class].item()
     
     # Get top n% of heatmap
     threshold = np.percentile(heatmap, 100 - n_percent)
@@ -162,29 +151,25 @@ def compute_sensitivity_n(model, img_tensor, heatmap, target_class, n_percent=10
     # Perturb top regions (set to mean value)
     perturbed_img = img_tensor.clone()
     mean_val = img_tensor.mean()
-    # Convert mask to tensor and move to same device
     device = img_tensor.device
     mask_tensor = torch.from_numpy(mask).unsqueeze(0).to(device)
     perturbed_img = perturbed_img * (1 - mask_tensor) + mean_val * mask_tensor
     
     # Get new confidence
     with torch.no_grad():
-        if hasattr(model, 'get_feature_map'):
-            # Hybrid model
-            new_conf = torch.softmax(wrapped_model(perturbed_img.unsqueeze(0)), dim=1)[0, target_class].item()
-        else:
-            # Regular detection model
-            new_conf = torch.softmax(model(perturbed_img.unsqueeze(0)), dim=1)[0, target_class].item()
+        new_conf = torch.softmax(model(perturbed_img.unsqueeze(0)), dim=1)[0, target_class].item()
     
     # Sensitivity is the absolute change in confidence
     sensitivity = abs(original_conf - new_conf)
     return sensitivity
 
+# ============================================================================
+# LOCALIZATION METRICS
+# ============================================================================
+
 def compute_localization_agreement(heatmap, ground_truth_mask, threshold=0.5):
-    """
-    Compute IoU between thresholded heatmap and ground truth segmentation mask
-    """
-    # Threshold heatmap
+    """Compute IoU between thresholded heatmap and ground truth segmentation mask"""
+    # Threshold heatmap to binary
     heatmap_binary = (heatmap > threshold).astype(np.float32)
     
     # Ensure same shape
@@ -201,6 +186,10 @@ def compute_localization_agreement(heatmap, ground_truth_mask, threshold=0.5):
     iou = intersection / (union + 1e-8)
     return iou
 
+# ============================================================================
+# COMPREHENSIVE EVALUATION
+# ============================================================================
+
 def evaluate_explainability(model, img_tensor, img_np, target_class, ground_truth_mask=None):
     """
     Comprehensive explainability evaluation
@@ -209,31 +198,20 @@ def evaluate_explainability(model, img_tensor, img_np, target_class, ground_trut
     # Generate explanations
     gradcam = explain_gradcam(model, img_tensor, target_class)
     
-    # Handle hybrid model vs regular model for LIME
-    if hasattr(model, 'get_feature_map'):
-        # Hybrid model
-        def lime_predict_fn(images):
-            batch = []
-            for img in images:
-                img_tensor = torch.from_numpy(img).permute(2, 0, 1).float()
-                img_tensor = (img_tensor - torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)) / torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
-                batch.append(img_tensor)
-            batch_tensor = torch.stack(batch)
-            with torch.no_grad():
-                logits_cls, _, _ = model(batch_tensor)
-                return logits_cls.softmax(1).cpu().numpy()
-    else:
-        # Regular detection model
-        def lime_predict_fn(images):
-            batch = []
-            for img in images:
-                img_tensor = torch.from_numpy(img).permute(2, 0, 1).float()
-                img_tensor = (img_tensor - torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)) / torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
-                batch.append(img_tensor)
-            batch_tensor = torch.stack(batch)
-            with torch.no_grad():
-                return model(batch_tensor).softmax(1).cpu().numpy()
+    # Regular detection model prediction function for LIME
+    def lime_predict_fn(images):
+        batch = []
+        for img in images:
+            # Preprocess image
+            img_tensor = torch.from_numpy(img).permute(2, 0, 1).float()
+            img_tensor = (img_tensor - torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)) / torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+            batch.append(img_tensor)
+        
+        batch_tensor = torch.stack(batch)
+        with torch.no_grad():
+            return model(batch_tensor).softmax(1).cpu().numpy()
     
+    # Generate LIME explanation
     lime_mask = explain_lime(lime_predict_fn, img_np)
     
     # Compute metrics
@@ -263,15 +241,17 @@ def evaluate_explainability(model, img_tensor, img_np, target_class, ground_trut
     
     return metrics, gradcam, lime_mask
 
+# ============================================================================
+# RISE EXPLANATION
+# ============================================================================
+
 def explain_rise(model, img_tensor, target_class, num_masks=1000, mask_size=7, prob_threshold=0.5):
-    """
-    RISE (Randomized Input Sampling for Explanation) implementation
-    """
+    """RISE (Randomized Input Sampling for Explanation) implementation"""
     model.eval()
     device = next(model.parameters()).device
     img_tensor = img_tensor.to(device)
     
-    # Generate random masks
+    # Generate random binary masks
     masks = np.random.binomial(1, prob_threshold, (num_masks, mask_size, mask_size))
     masks = masks.astype(np.float32)
     
@@ -289,33 +269,25 @@ def explain_rise(model, img_tensor, target_class, num_masks=1000, mask_size=7, p
             mask_tensor = torch.from_numpy(mask).unsqueeze(0).unsqueeze(0).to(device)
             masked_img = masked_img * mask_tensor
             
-            # Get prediction
-            if hasattr(model, 'get_feature_map'):
-                # Hybrid model
-                class ModelWrapper:
-                    def __init__(self, model):
-                        self.model = model
-                    def __call__(self, x):
-                        logits_cls, _, _ = self.model(x)
-                        return logits_cls
-                wrapped_model = ModelWrapper(model)
-                output = wrapped_model(masked_img.unsqueeze(0))
-            else:
-                output = model(masked_img.unsqueeze(0))
+            # Get prediction (regular detection model)
+            output = model(masked_img.unsqueeze(0))
             
+            # Get probability for target class
             prob = torch.softmax(output, dim=1)[0, target_class].item()
             
             # Weighted sum
             explanations += prob * mask
     
-    # Normalize
+    # Normalize explanations
     explanations = (explanations - explanations.min()) / (explanations.max() - explanations.min() + 1e-8)
     return explanations
 
+# ============================================================================
+# SHAP EXPLANATION
+# ============================================================================
+
 def explain_shap(model, img_tensor, target_class, num_samples=100):
-    """
-    SHAP (SHapley Additive exPlanations) implementation using KernelExplainer
-    """
+    """SHAP (SHapley Additive exPlanations) implementation using KernelExplainer"""
     try:
         import shap
     except ImportError:
@@ -347,13 +319,14 @@ def explain_shap(model, img_tensor, target_class, num_samples=100):
     if isinstance(shap_values, list):
         shap_values = shap_values[target_class]
     
+    # Process SHAP values
     shap_heatmap = shap_values.reshape(img_np.shape[:2])
-    shap_heatmap = np.abs(shap_heatmap)
+    shap_heatmap = np.abs(shap_heatmap)  # Use absolute values
     shap_heatmap = (shap_heatmap - shap_heatmap.min()) / (shap_heatmap.max() - shap_heatmap.min() + 1e-8)
     
     return shap_heatmap
 
-def _shap_predict_fn(self, x, model, device):
+def _shap_predict_fn(x, model, device):
     """Helper function for SHAP predictions"""
     # Reshape input
     x_reshaped = x.reshape(-1, 3, 224, 224)
@@ -361,36 +334,27 @@ def _shap_predict_fn(self, x, model, device):
     # Convert to tensor
     x_tensor = torch.from_numpy(x_reshaped).float().to(device)
     
-    # Get predictions
+    # Get predictions (regular detection model)
     with torch.no_grad():
-        if hasattr(model, 'get_feature_map'):
-            # Hybrid model
-            class ModelWrapper:
-                def __init__(self, model):
-                    self.model = model
-                def __call__(self, x):
-                    logits_cls, _, _ = self.model(x)
-                    return logits_cls
-            wrapped_model = ModelWrapper(model)
-            output = wrapped_model(x_tensor)
-        else:
-            output = model(x_tensor)
-        
+        output = model(x_tensor)
         probs = torch.softmax(output, dim=1)
     
     return probs.detach().cpu().numpy()
 
+# ============================================================================
+# GRAD-CAM++ EXPLANATION
+# ============================================================================
+
 def explain_gradcam_plus_plus(model, img_tensor, target_class):
-    """
-    Grad-CAM++ implementation (enhanced version of Grad-CAM)
-    """
+    """Grad-CAM++ implementation (enhanced version of Grad-CAM)"""
     model.eval()
     device = next(model.parameters()).device
     img_tensor = img_tensor.to(device)
     
-    # Use the existing Grad-CAM implementation as base
+    # For now, use the existing Grad-CAM implementation as base
+    # Grad-CAM++ typically involves computing higher-order derivatives
     base_cam = explain_gradcam(model, img_tensor, target_class)
     
-    # For now, return the base Grad-CAM (you can enhance this with Grad-CAM++ specific logic)
-    # Grad-CAM++ typically involves computing higher-order derivatives
+    # TODO: Enhance with Grad-CAM++ specific logic
+    # This would involve computing higher-order gradients and weights
     return base_cam

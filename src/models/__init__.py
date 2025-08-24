@@ -1,3 +1,3 @@
-from .models import DetectionModel, SegmentationModel
+from .models import VanillaCNN, UNet
 
-__all__ = ['DetectionModel', 'SegmentationModel'] 
+__all__ = ['VanillaCNN', 'UNet'] 

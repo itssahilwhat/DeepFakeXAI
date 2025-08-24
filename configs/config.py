@@ -16,8 +16,7 @@ lr            = 1e-4
 epochs        = 30
 seg_loss_w    = 0.5
 
-# Models
-det_backbone  = "convnext_tiny"
+# Image configuration
 img_size      = (224, 224)
 
 # Balancing

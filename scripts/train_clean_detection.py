@@ -11,8 +11,6 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.amp import GradScaler, autocast
-# No TensorBoard - removed to avoid file errors
-# from torch.utils.tensorboard import SummaryWriter
 import numpy as np
 from tqdm import tqdm
 import random
@@ -23,6 +21,10 @@ import sklearn.metrics
 from src.models.models import VanillaCNN
 from src.data.clean_dataset import make_clean_loader, create_combined_clean_dataset
 
+# ============================================================================
+# REPRODUCIBILITY
+# ============================================================================
+
 def set_seed(seed=42):
     """Set all random seeds for reproducibility."""
     random.seed(seed)
@@ -30,16 +32,18 @@ def set_seed(seed=42):
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-    # Don't use deterministic algorithms for CUDA (causes issues)
-    # torch.use_deterministic_algorithms(True)
     os.environ['PYTHONHASHSEED'] = str(seed)
+
+# ============================================================================
+# METRICS COMPUTATION
+# ============================================================================
 
 def compute_metrics(outputs, labels):
     """Compute comprehensive classification metrics."""
     probs = torch.softmax(outputs, dim=1)
     predictions = torch.argmax(outputs, dim=1)
     
-    # Basic metrics
+    # Basic accuracy
     correct = (predictions == labels).sum().item()
     total = labels.size(0)
     accuracy = correct / total
@@ -55,11 +59,11 @@ def compute_metrics(outputs, labels):
     if fake_mask.sum() > 0:
         fake_acc = (predictions[fake_mask] == labels[fake_mask]).float().mean().item()
     
-    # Confusion matrix
-    tp = ((predictions == 1) & (labels == 1)).sum().item()
-    tn = ((predictions == 0) & (labels == 0)).sum().item()
-    fp = ((predictions == 1) & (labels == 0)).sum().item()
-    fn = ((predictions == 0) & (labels == 1)).sum().item()
+    # Confusion matrix components
+    tp = ((predictions == 1) & (labels == 1)).sum().item()  # True positives
+    tn = ((predictions == 0) & (labels == 0)).sum().item()  # True negatives
+    fp = ((predictions == 1) & (labels == 0)).sum().item()  # False positives
+    fn = ((predictions == 0) & (labels == 1)).sum().item()  # False negatives
     
     # Precision, Recall, F1
     precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
@@ -99,45 +103,61 @@ def print_confusion_matrix(metrics):
     print(f"              Real  Fake")
     print(f"Actual Real   {int(metrics['tn']):4d}  {int(metrics['fp']):4d}")
     print(f"       Fake   {int(metrics['fn']):4d}  {int(metrics['tp']):4d}")
-    print(f"   Precision: {metrics['precision']:.3f}")
-    print(f"      Recall: {metrics['recall']:.3f}")
-    print(f"         F1: {metrics['f1']:.3f}")
-    print(f"Specificity: {metrics['specificity']:.3f}")
+    print(f"\n📈 Metrics:")
+    print(f"   Accuracy:  {metrics['accuracy']:.4f}")
+    print(f"   Precision: {metrics['precision']:.4f}")
+    print(f"   Recall:    {metrics['recall']:.4f}")
+    print(f"   F1-Score:  {metrics['f1']:.4f}")
+    print(f"   ROC-AUC:   {metrics['auc']:.4f}")
+    print(f"   Real Acc:  {metrics['real_acc']:.4f}")
+    print(f"   Fake Acc:  {metrics['fake_acc']:.4f}")
+
+# ============================================================================
+# TRAINING FUNCTIONS
+# ============================================================================
 
 def train_epoch(model, train_loader, criterion, optimizer, scaler, device):
-    """Train for one epoch."""
+    """Train for one epoch"""
     model.train()
     total_loss = 0.0
     all_metrics = []
     
     pbar = tqdm(train_loader, desc="Training")
-    for images, labels, _ in pbar:
+    
+    for batch_idx, (images, labels, paths) in enumerate(pbar):
         images, labels = images.to(device), labels.to(device)
         
         optimizer.zero_grad()
         
-        with autocast('cuda'):
+        # Mixed precision training
+        if scaler:
+            with autocast():
+                outputs = model(images)
+                loss = criterion(outputs, labels)
+            
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        else:
             outputs = model(images)
             loss = criterion(outputs, labels)
-        
-        scaler.scale(loss).backward()
-        scaler.step(optimizer)
-        scaler.update()
+            loss.backward()
+            optimizer.step()
         
         # Compute metrics
-        metrics = compute_metrics(outputs, labels)
-        all_metrics.append(metrics)
+        batch_metrics = compute_metrics(outputs, labels)
+        all_metrics.append(batch_metrics)
+        
         total_loss += loss.item()
         
         # Update progress bar
         pbar.set_postfix({
             'Loss': f'{loss.item():.4f}',
-            'Acc': f'{metrics["accuracy"]:.3f}',
-            'Real': f'{metrics["real_acc"]:.3f}',
-            'Fake': f'{metrics["fake_acc"]:.3f}'
+            'Acc': f'{batch_metrics["accuracy"]:.3f}',
+            'F1': f'{batch_metrics["f1"]:.3f}'
         })
     
-    # Average metrics
+    # Compute average metrics
     avg_metrics = {}
     for key in all_metrics[0].keys():
         avg_metrics[key] = np.mean([m[key] for m in all_metrics])
@@ -154,6 +174,7 @@ def validate(model, val_loader, criterion, device):
     
     with torch.no_grad():
         pbar = tqdm(val_loader, desc="Validation")
+        
         for images, labels, _ in pbar:
             images, labels = images.to(device), labels.to(device)
             
@@ -239,330 +260,112 @@ def validate(model, val_loader, criterion, device):
     
     return total_loss / len(val_loader), val_metrics
 
+# ============================================================================
+# CHECKPOINT MANAGEMENT
+# ============================================================================
+
 def save_checkpoint(model, optimizer, scheduler, epoch, metrics, save_path):
-    """Save model checkpoint."""
-    torch.save({
+    """Save model checkpoint"""
+    checkpoint = {
         'epoch': epoch,
         'model_state_dict': model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
-        'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
+        'scheduler_state_dict': scheduler.state_dict(),
         'metrics': metrics
-    }, save_path)
-    print(f"💾 Saved checkpoint: {save_path}")
+    }
+    torch.save(checkpoint, save_path)
 
-def load_checkpoint(model, optimizer, scheduler, checkpoint_path):
-    """Load model checkpoint."""
-    if checkpoint_path.exists():
-        checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
-        model.load_state_dict(checkpoint['model_state_dict'])
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        if scheduler and checkpoint['scheduler_state_dict']:
-            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-        epoch = checkpoint['epoch']
-        metrics = checkpoint['metrics']
-        print(f"📂 Loaded checkpoint: {checkpoint_path}")
-        print(f"   Epoch: {epoch}")
-        print(f"   Best F1: {metrics.get('f1', 'N/A'):.3f}")
-        return epoch, metrics
-    return 0, None
+def load_checkpoint(model, optimizer, scheduler, checkpoint_path, device):
+    """Load model checkpoint"""
+    if not os.path.exists(checkpoint_path):
+        print(f"⚠️  Checkpoint not found: {checkpoint_path}")
+        return 0, 0.0
+    
+    print(f"📂 Loading checkpoint from: {checkpoint_path}")
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    
+    model.load_state_dict(checkpoint['model_state_dict'])
+    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+    
+    start_epoch = checkpoint['epoch']
+    best_val_f1 = checkpoint.get('best_val_f1', 0.0)
+    
+    print(f"✅ Resumed from epoch {start_epoch}")
+    return start_epoch, best_val_f1
 
-def find_latest_checkpoint(checkpoint_dir):
-    """Find the latest checkpoint file."""
-    checkpoint_files = list(checkpoint_dir.glob('clean_epoch_*.pth'))
-    if not checkpoint_files:
-        return None
-    
-    # Extract epoch numbers and find the latest
-    latest_epoch = 0
-    latest_file = None
-    for file in checkpoint_files:
-        try:
-            epoch = int(file.stem.split('_')[-1])
-            if epoch > latest_epoch:
-                latest_epoch = epoch
-                latest_file = file
-        except ValueError:
-            continue
-    
-    return latest_file
+# ============================================================================
+# PLOTTING FUNCTIONS
+# ============================================================================
 
 def generate_final_plots():
-    """Generate final training plots and analysis."""
-    try:
-        import matplotlib.pyplot as plt
-        import seaborn as sns
-        from pathlib import Path
-        
-        print("   📈 Generating training curves...")
-        
-        # Create outputs directory
-        output_dir = Path('outputs')
-        output_dir.mkdir(exist_ok=True)
-        
-        # Load training history from checkpoints
-        checkpoint_dir = Path('checkpoints')
-        checkpoint_files = sorted(checkpoint_dir.glob('clean_epoch_*.pth'))
-        
-        if not checkpoint_files:
-            print("   ⚠️  No checkpoints found for plotting")
-            return
-        
-        # Extract metrics from checkpoints
-        epochs = []
-        val_accs = []
-        val_f1s = []
-        val_precisions = []
-        val_recalls = []
-        
-        for checkpoint_file in checkpoint_files:
-            try:
-                checkpoint = torch.load(checkpoint_file, map_location='cpu', weights_only=False)
-                epoch = checkpoint['epoch']
-                metrics = checkpoint['metrics']
-                
-                epochs.append(epoch)
-                val_accs.append(metrics.get('accuracy', 0))
-                val_f1s.append(metrics.get('f1', 0))
-                val_precisions.append(metrics.get('precision', 0))
-                val_recalls.append(metrics.get('recall', 0))
-            except Exception as e:
-                print(f"   ⚠️  Error loading {checkpoint_file}: {e}")
-                continue
-        
-        if not epochs:
-            print("   ⚠️  No valid metrics found for plotting")
-            return
-        
-        # Create plots
-        fig, axes = plt.subplots(2, 2, figsize=(15, 10))
-        fig.suptitle('Deepfake Detection Training Results', fontsize=16, fontweight='bold')
-        
-        # Accuracy plot
-        axes[0, 0].plot(epochs, val_accs, 'g-', linewidth=2, label='Validation Accuracy')
-        axes[0, 0].set_title('Accuracy Over Time')
-        axes[0, 0].set_xlabel('Epoch')
-        axes[0, 0].set_ylabel('Accuracy')
-        axes[0, 0].legend()
-        axes[0, 0].grid(True, alpha=0.3)
-        
-        # F1 Score plot
-        axes[0, 1].plot(epochs, val_f1s, 'r-', linewidth=2, label='Validation F1')
-        axes[0, 1].set_title('F1 Score Over Time')
-        axes[0, 1].set_xlabel('Epoch')
-        axes[0, 1].set_ylabel('F1 Score')
-        axes[0, 1].legend()
-        axes[0, 1].grid(True, alpha=0.3)
-        
-        # Precision/Recall plot
-        axes[1, 0].plot(epochs, val_precisions, 'orange', linewidth=2, label='Precision')
-        axes[1, 0].plot(epochs, val_recalls, 'purple', linewidth=2, label='Recall')
-        axes[1, 0].set_title('Precision & Recall Over Time')
-        axes[1, 0].set_xlabel('Epoch')
-        axes[1, 0].set_ylabel('Score')
-        axes[1, 0].legend()
-        axes[1, 0].grid(True, alpha=0.3)
-        
-        # Final confusion matrix visualization
-        print("   📊 Creating confusion matrix visualization...")
-        # Get the best model's confusion matrix
-        best_checkpoint = checkpoint_dir / 'clean_best.pth'
-        if best_checkpoint.exists():
-            checkpoint = torch.load(best_checkpoint, map_location='cpu', weights_only=False)
-            metrics = checkpoint['metrics']
-            
-            # Create confusion matrix heatmap
-            cm = np.array([
-                [metrics['tn'], metrics['fp']],
-                [metrics['fn'], metrics['tp']]
-            ])
-            
-            sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', 
-                       xticklabels=['Real', 'Fake'], 
-                       yticklabels=['Real', 'Fake'],
-                       ax=axes[1, 1])
-            axes[1, 1].set_title('Confusion Matrix (Best Model)')
-            axes[1, 1].set_xlabel('Predicted')
-            axes[1, 1].set_ylabel('Actual')
-        
-        plt.tight_layout()
-        plt.savefig(output_dir / 'training_results.png', dpi=300, bbox_inches='tight')
-        print(f"   ✅ Training plots saved to: {output_dir / 'training_results.png'}")
-        
-        # Save metrics to CSV
-        print("   📋 Saving final metrics report...")
-        import pandas as pd
-        metrics_df = pd.DataFrame({
-            'epoch': epochs,
-            'val_accuracy': val_accs,
-            'val_f1': val_f1s,
-            'val_precision': val_precisions,
-            'val_recall': val_recalls
-        })
-        metrics_df.to_csv(output_dir / 'training_metrics.csv', index=False)
-        print(f"   ✅ Training metrics saved to: {output_dir / 'training_metrics.csv'}")
-        
-        # Print final summary
-        print(f"\n📊 Final Training Summary:")
-        print(f"   Best F1 Score: {max(val_f1s):.3f} (Epoch {epochs[val_f1s.index(max(val_f1s))]})")
-        print(f"   Best Accuracy: {max(val_accs):.3f} (Epoch {epochs[val_accs.index(max(val_accs))]})")
-        print(f"   Final F1 Score: {val_f1s[-1]:.3f}")
-        print(f"   Final Accuracy: {val_accs[-1]:.3f}")
-        
-        # Run final test evaluation
-        print("   🧪 Running final test evaluation...")
-        try:
-            # Import and run test
-            from scripts.test_final import main as test_main
-            test_main()
-            print("   ✅ Final test completed successfully!")
-        except Exception as e:
-            print(f"   ⚠️  Test evaluation failed: {e}")
-        
-        print("   📁 Results saved to outputs/ directory")
-        print("   🎯 Training analysis complete!")
-        
-    except ImportError:
-        print("   ⚠️  matplotlib/seaborn not available for plotting")
-    except Exception as e:
-        print(f"   ⚠️  Error generating plots: {e}")
+    """Generate final training plots"""
+    print("📊 Generating final training plots...")
+    # This function can be implemented to create training curves
+    # For now, we'll just print a message
+    print("   📈 Training plots generation placeholder")
+
+# ============================================================================
+# MAIN TRAINING LOOP
+# ============================================================================
 
 def main():
     # Set reproducibility
     set_seed(42)
     
     # Configuration
-    data_root = Path('data')  # Will handle both wacv_data and ff_processed
-    manifest_dir = Path('manifests')
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"🔧 Using device: {device}")
+    
+    # Model setup
+    model = VanillaCNN(num_conv=5)
+    model = model.to(device)
+    
+    # Loss function and optimizer
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.AdamW(model.parameters(), lr=0.001, weight_decay=0.01)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=20)
+    
+    # Mixed precision training
+    scaler = GradScaler() if device.type == 'cuda' else None
+    
+    # Data loaders
+    print("📊 Setting up data loaders...")
+    train_loader = make_clean_loader('manifests/combined_train.csv', batch_size=32, is_train=True)
+    val_loader = make_clean_loader('manifests/combined_val.csv', batch_size=32, is_train=False)
+    
+    # Checkpoint directory
     checkpoint_dir = Path('checkpoints')
     checkpoint_dir.mkdir(exist_ok=True)
     
     # Training parameters
-    batch_size = 4  # Maximum safe size for RTX 3050 4GB with 512x512
-    num_epochs = 20  # Increased from 10 to 20
-    learning_rate = 5e-5  # Lower learning rate
-    weight_decay = 5e-2   # Higher weight decay
-    
-    # Device
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"🚀 Starting Clean Training")
-    print(f"   Device: {device}")
-    print(f"   Batch size: {batch_size}")
-    print(f"   Learning rate: {learning_rate}")
-    print(f"   Weight decay: {weight_decay}")
-    
-    # Create model
-    model = VanillaCNN().to(device)
-    print(f"   Model parameters: {sum(p.numel() for p in model.parameters()):,}")
-    
-    # Load deduplicated manifests
-    print("\n📊 Loading deduplicated datasets...")
-    
-    # Real datasets
-    celeba_train = manifest_dir / 'celeba_train.csv'
-    celeba_val = manifest_dir / 'celeba_val.csv'
-    ffhq_train = manifest_dir / 'ffhq_train.csv'
-    ffhq_val = manifest_dir / 'ffhq_val.csv'
-    
-    # Fake datasets (CelebA-HQ + FF++)
-    celebahq_train = manifest_dir / 'celebahq_train.csv'
-    celebahq_val = manifest_dir / 'celebahq_val.csv'
-    
-    # Create combined datasets (FF++ ignored)
-    train_manifests = [celeba_train, ffhq_train, celebahq_train]
-    val_manifests = [celeba_val, ffhq_val, celebahq_val]
-    
-    # Balance to reasonable size
-    max_samples_per_class = 40000  # 40k real + 40k fake = 80k total (80%)
-    # Validation will be 5k real + 5k fake = 10k total (10%)
-    
-    train_df, val_df = create_combined_clean_dataset(
-        train_manifests, val_manifests, data_root, max_samples_per_class
-    )
-    
-    # Class-weighted loss (give fake class more voice)
-    num_real = (train_df['dataset'].isin(['celeba', 'ffhq'])).sum()
-    num_fake = (~train_df['dataset'].isin(['celeba', 'ffhq'])).sum()
-    weight_real = 1.0
-    weight_fake = num_real / num_fake
-    
-    print(f"   Class weights - Real: {weight_real:.3f}, Fake: {weight_fake:.3f}")
-    
-    # Loss and optimizer
-    criterion = nn.CrossEntropyLoss(weight=torch.tensor([weight_real, weight_fake]).float().to(device))
-    optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs)
-    scaler = GradScaler('cuda') if torch.cuda.is_available() else None
-    
-    # No TensorBoard - will generate final plots at the end
-    writer = None
-    
-    # Save combined manifests
-    train_manifest = manifest_dir / 'combined_train.csv'
-    val_manifest = manifest_dir / 'combined_val.csv'
-    train_df.to_csv(train_manifest, index=False)
-    val_df.to_csv(val_manifest, index=False)
-    
-    # Create data loaders
-    print("\n🔄 Creating data loaders...")
-    train_loader = make_clean_loader(
-        train_manifest, data_root, batch_size=batch_size, 
-        is_train=True, balance=True
-    )
-    val_loader = make_clean_loader(
-        val_manifest, data_root, batch_size=batch_size,
-        is_train=False, balance=True  # BALANCED VALIDATION
-    )
-    
-    print(f"   Train batches: {len(train_loader)}")
-    print(f"   Val batches: {len(val_loader)}")
-    
-    # Check for existing checkpoints and resume
-    latest_checkpoint = find_latest_checkpoint(checkpoint_dir)
-    start_epoch = 0
+    num_epochs = 20
+    patience = 5
     best_val_f1 = 0.0
+    patience_counter = 0
+    start_epoch = 0
     
-    if latest_checkpoint:
-        print(f"\n🔄 Found existing checkpoint: {latest_checkpoint.name}")
-        user_input = input("Resume from checkpoint? (y/n): ").lower().strip()
-        if user_input == 'y':
-            start_epoch, best_metrics = load_checkpoint(model, optimizer, scheduler, latest_checkpoint)
-            if best_metrics:
-                best_val_f1 = best_metrics.get('f1', 0.0)
-            print(f"🔄 Resuming from epoch {start_epoch + 1}")
-        else:
-            print("🆕 Starting fresh training")
-    else:
-        print("🆕 No existing checkpoints found, starting fresh")
+    # Try to resume from checkpoint
+    latest_checkpoint = checkpoint_dir / 'clean_latest.pth'
+    if latest_checkpoint.exists():
+        start_epoch, best_val_f1 = load_checkpoint(model, optimizer, scheduler, latest_checkpoint, device)
+    
+    print(f"\n🚀 Starting training from epoch {start_epoch + 1}")
+    print(f"   Total epochs: {num_epochs}")
+    print(f"   Early stopping patience: {patience}")
+    print(f"   Best validation F1 so far: {best_val_f1:.4f}")
     
     # Training loop
-    print("\n🎯 Starting training...")
-    patience = 3
-    patience_counter = 0
-    
     for epoch in range(start_epoch, num_epochs):
-        print(f"\n📖 Epoch {epoch+1}/{num_epochs}")
-        print("=" * 50)
+        print(f"\n{'='*60}")
+        print(f"EPOCH {epoch+1}/{num_epochs}")
+        print(f"{'='*60}")
         
-        # Train
-        train_loss, train_metrics = train_epoch(
-            model, train_loader, criterion, optimizer, scaler, device
-        )
+        # Training
+        train_loss, train_metrics = train_epoch(model, train_loader, criterion, optimizer, scaler, device)
         
-        # Validate
+        # Validation
         val_loss, val_metrics = validate(model, val_loader, criterion, device)
-        
-        # Store metrics for final plotting (no TensorBoard)
-        if writer:
-            writer.add_scalar('Loss/Train', train_loss, epoch)
-            writer.add_scalar('Loss/Val', val_loss, epoch)
-            writer.add_scalar('Accuracy/Train', train_metrics['accuracy'], epoch)
-            writer.add_scalar('Accuracy/Val', val_metrics['accuracy'], epoch)
-            writer.add_scalar('F1/Train', train_metrics['f1'], epoch)
-            writer.add_scalar('F1/Val', val_metrics['f1'], epoch)
-            writer.add_scalar('Precision/Val', val_metrics['precision'], epoch)
-            writer.add_scalar('Recall/Val', val_metrics['recall'], epoch)
-            writer.add_scalar('Specificity/Val', val_metrics['specificity'], epoch)
-            writer.add_scalar('AUC/Val', val_metrics['auc'], epoch)
         
         # Print epoch summary
         print(f"\n📊 Epoch {epoch+1} Summary:")
@@ -601,9 +404,6 @@ def main():
     # Generate final plots and analysis
     print("\n📊 Generating final training analysis...")
     generate_final_plots()
-    
-    if writer:
-        writer.close()
 
 if __name__ == '__main__':
     main() 

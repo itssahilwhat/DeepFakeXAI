@@ -13,22 +13,32 @@ from tqdm import tqdm
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from configs.config import lr, epochs, dir_ckpt, seg_loss_w
-from src.models.models import DetectionModel, SegmentationModel, HybridDeepfakeModel
 from src.data.clean_dataset import make_clean_loader
 import os
 
+# ============================================================================
+# UTILITY FUNCTIONS
+# ============================================================================
+
 def to_device(model):
+    """Move model to appropriate device (GPU/CPU)"""
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     return model.to(device), device
 
 def dice_loss(pred, target, smooth=1e-6):
-    """Compute Dice loss"""
+    """Compute Dice loss for segmentation"""
     pred = torch.sigmoid(pred)
     intersection = (pred * target).sum()
     dice = (2. * intersection + smooth) / (pred.sum() + target.sum() + smooth)
     return 1 - dice
 
+# ============================================================================
+# SEGMENTATION TRAINER
+# ============================================================================
+
 class SegmentationTrainer:
+    """Trainer for deepfake segmentation models"""
+    
     def __init__(self, model, train_loader, val_loader, optimizer, scheduler, device, checkpoint_dir, patience=5, resume_from=None):
         self.model = model
         self.train_loader = train_loader
@@ -45,9 +55,11 @@ class SegmentationTrainer:
         self.best_pixel_acc = 0.0
         self.patience_counter = 0
         self.start_epoch = 0
+        
+        # Mixed precision training
         self.scaler = GradScaler('cuda') if torch.cuda.is_available() else None
         
-        # Loss functions - Focal BCE + Dice
+        # Loss functions
         self.focal_criterion = self.focal_bce_loss
         self.dice_criterion = self.dice_loss
         
@@ -62,7 +74,7 @@ class SegmentationTrainer:
             self.load_latest_checkpoint()
         
     def dice_loss(self, pred, target, smooth=1e-6):
-        """Compute Dice loss"""
+        """Compute Dice loss for segmentation"""
         pred = torch.sigmoid(pred)
         intersection = (pred * target).sum()
         dice = (2. * intersection + smooth) / (pred.sum() + target.sum() + smooth)
@@ -76,12 +88,15 @@ class SegmentationTrainer:
         return focal_loss.mean()
     
     def train_epoch(self, epoch):
+        """Train for one epoch"""
         self.model.train()
         total_loss = 0.0
         num_batches = 0
         
         pbar = tqdm(self.train_loader, desc=f"Epoch {epoch+1} [Train]")
+        
         for batch_idx, batch in enumerate(pbar):
+            # Handle different batch formats
             if len(batch) == 3:
                 images, masks, labels = batch
             else:
@@ -94,42 +109,50 @@ class SegmentationTrainer:
             
             self.optimizer.zero_grad()
             
+            # Mixed precision training
             if self.scaler:
                 with autocast('cuda'):
                     outputs = self.model(images)
-                    # Handle multi-scale outputs (UNet training mode may return a tuple)
+                    
+                    # Handle multi-scale outputs (UNet training mode)
                     if isinstance(outputs, (tuple, list)):
+                        # Clamp outputs to prevent extreme values
                         outputs = tuple(torch.clamp(out, -20, 20) for out in outputs)
                         out_main, out_2x, out_4x = outputs
-                        # Resize GT masks to match each scale using nearest to preserve binarity
+                        
+                        # Resize GT masks to match each scale
                         mask_main = F.interpolate(masks, size=out_main.shape[-2:], mode='nearest')
                         mask_2x = F.interpolate(masks, size=out_2x.shape[-2:], mode='nearest')
                         mask_4x = F.interpolate(masks, size=out_4x.shape[-2:], mode='nearest')
+                        
                         # Compute weighted multi-scale loss
                         loss_main = self.focal_criterion(out_main, mask_main) + self.dice_criterion(out_main, mask_main)
                         loss_2x = self.focal_criterion(out_2x, mask_2x) + self.dice_criterion(out_2x, mask_2x)
                         loss_4x = self.focal_criterion(out_4x, mask_4x) + self.dice_criterion(out_4x, mask_4x)
                         loss = 1.0 * loss_main + 0.5 * loss_2x + 0.25 * loss_4x
                     else:
-                        # Clamp outputs to prevent extreme logits
+                        # Single output
                         outputs = torch.clamp(outputs, -20, 20)
-                        # Focal BCE + Dice loss
                         loss = self.focal_criterion(outputs, masks) + self.dice_criterion(outputs, masks)
                 
+                # Backward pass with mixed precision
                 self.scaler.scale(loss).backward()
-                # Gradient clipping before unscaling
                 self.scaler.unscale_(self.optimizer)
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
             else:
+                # Regular training without mixed precision
                 outputs = self.model(images)
+                
                 if isinstance(outputs, (tuple, list)):
                     outputs = tuple(torch.clamp(out, -20, 20) for out in outputs)
                     out_main, out_2x, out_4x = outputs
+                    
                     mask_main = F.interpolate(masks, size=out_main.shape[-2:], mode='nearest')
                     mask_2x = F.interpolate(masks, size=out_2x.shape[-2:], mode='nearest')
                     mask_4x = F.interpolate(masks, size=out_4x.shape[-2:], mode='nearest')
+                    
                     loss_main = self.focal_criterion(out_main, mask_main) + self.dice_criterion(out_main, mask_main)
                     loss_2x = self.focal_criterion(out_2x, mask_2x) + self.dice_criterion(out_2x, mask_2x)
                     loss_4x = self.focal_criterion(out_4x, mask_4x) + self.dice_criterion(out_4x, mask_4x)
@@ -138,6 +161,7 @@ class SegmentationTrainer:
                     outputs = torch.clamp(outputs, -20, 20)
                     loss = self.focal_criterion(outputs, masks) + self.dice_criterion(outputs, masks)
                 
+                # Regular backward pass
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
                 self.optimizer.step()
@@ -160,7 +184,9 @@ class SegmentationTrainer:
         
         with torch.no_grad():
             pbar = tqdm(self.val_loader, desc="Validation")
+            
             for batch_idx, batch in enumerate(pbar):
+                # Handle different batch formats
                 if len(batch) == 3:
                     images, masks, labels = batch
                 else:
@@ -179,17 +205,17 @@ class SegmentationTrainer:
                 # Convert to binary predictions
                 pred_masks = torch.sigmoid(outputs) > 0.5
                 
-                # Compute metrics
+                # Compute metrics for each sample
                 for i in range(images.size(0)):
                     pred = pred_masks[i]
                     target = masks[i] > 0.5
                     
-                    # IoU
+                    # IoU (Intersection over Union)
                     intersection = (pred & target).sum()
                     union = (pred | target).sum()
                     iou = intersection / union if union > 0 else 0.0
                     
-                    # Dice
+                    # Dice coefficient
                     dice = (2 * intersection) / (pred.sum() + target.sum()) if (pred.sum() + target.sum()) > 0 else 0.0
                     
                     # Pixel accuracy
@@ -215,7 +241,7 @@ class SegmentationTrainer:
         }
     
     def save_checkpoint(self, epoch, metrics, is_best=False):
-        """Save checkpoint"""
+        """Save model checkpoint"""
         checkpoint = {
             'epoch': epoch,
             'model_state_dict': self.model.state_dict(),
@@ -256,10 +282,12 @@ class SegmentationTrainer:
             print(f"   Starting fresh training instead...")
             return False
         
+        # Load model and optimizer states
         self.model.load_state_dict(checkpoint['model_state_dict'])
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
         
+        # Load training state
         self.start_epoch = checkpoint['epoch'] + 1
         self.best_iou = checkpoint.get('best_iou', 0.0)
         self.best_dice = checkpoint.get('best_dice', 0.0)
@@ -281,6 +309,7 @@ class SegmentationTrainer:
             return False
     
     def fit(self, num_epochs, stage='stage2'):
+        """Main training loop"""
         print(f"\n🚀 Starting segmentation training for {num_epochs} epochs")
         print(f"   Stage: {stage}")
         print(f"   Device: {self.device}")
